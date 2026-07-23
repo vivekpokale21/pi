@@ -42,7 +42,7 @@ async function main() {
 	const payloads: unknown[] = [];
 	const toolEvents: AgentEvent[] = [];
 	const agent = new Agent({
-		streamFunction: streamSimple,
+		streamFn: streamSimple,
 		getApiKey: () => "local",
 		onPayload: (payload) => {
 			payloads.push(payload);

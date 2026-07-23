@@ -3,11 +3,15 @@ import { Type, type Static } from "../../packages/ai/src/index.ts";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, realpath, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { createParserAdapterForLanguage } from "./parser-adapters.ts";
+
+export type SemanticSearchLanguageTier = "full" | "structured" | "line-window";
 
 export interface SemanticSearchChunk {
 	id: string;
 	path: string;
 	language: string;
+	languageTier: SemanticSearchLanguageTier;
 	symbolName?: string;
 	symbolKind?: string;
 	startLine: number;
@@ -21,9 +25,48 @@ export interface SemanticSearchResult {
 	startLine: number;
 	endLine: number;
 	score: number;
+	languageTier: SemanticSearchLanguageTier;
 	symbolName?: string;
 	symbolKind?: string;
 	snippet: string;
+}
+
+export type SemanticSearchFreshness = "clean" | "dirty" | "unknown";
+export type SemanticSearchCompleteness = "complete" | "incomplete" | "unknown";
+export type SemanticSearchRecommendedAction =
+	| "use_bundle"
+	| "narrow_query"
+	| "raise_budget"
+	| "refresh_index"
+	| "fetch_skipped_candidate"
+	| "manual_review";
+
+export interface SemanticSearchSkippedCandidate {
+	path: string;
+	startLine: number;
+	endLine: number;
+	score: number;
+	languageTier: SemanticSearchLanguageTier;
+	symbolName?: string;
+	symbolKind?: string;
+}
+
+export interface SemanticSearchImportEdge {
+	fromPath: string;
+	specifier: string;
+	kind: "static" | "dynamic" | "reexport";
+	confidence: "high" | "medium" | "low";
+}
+
+export interface SemanticSearchReceipt {
+	freshness: SemanticSearchFreshness;
+	indexRevision: string;
+	returnedTotal: number;
+	skippedTotal: number;
+	contextComplete: SemanticSearchCompleteness;
+	contextCompleteReason: string;
+	recommendedNextAction: SemanticSearchRecommendedAction;
+	skippedCandidates: SemanticSearchSkippedCandidate[];
 }
 
 export interface SemanticSearchOutput {
@@ -34,6 +77,7 @@ export interface SemanticSearchOutput {
 	cachePath?: string;
 	indexedFiles: number;
 	indexedChunks: number;
+	receipt: SemanticSearchReceipt;
 	results: SemanticSearchResult[];
 	warnings: string[];
 }
@@ -45,6 +89,7 @@ export interface ChunkTextInput {
 	chunkLines?: number;
 	chunkOverlapLines?: number;
 	symbolChunks?: boolean;
+	languageTier?: SemanticSearchLanguageTier;
 }
 
 export interface SemanticSearchInput {
@@ -147,7 +192,7 @@ interface CachedFileEntry {
 }
 
 interface LexicalIndexCache {
-	version: 1;
+	version: 2;
 	root: string;
 	extensions: string[];
 	chunkLines: number;
@@ -160,6 +205,8 @@ interface IndexedChunks {
 	chunks: SemanticSearchChunk[];
 	indexedFiles: number;
 	indexRebuilt: boolean;
+	freshness: SemanticSearchFreshness;
+	indexRevision: string;
 	cachePath?: string;
 }
 
@@ -167,7 +214,7 @@ const DEFAULT_CHUNK_LINES = 80;
 const DEFAULT_CHUNK_OVERLAP_LINES = 20;
 const DEFAULT_MAX_RESULTS = 8;
 const DEFAULT_MAX_FILE_SIZE_BYTES = 512 * 1024;
-const LEXICAL_CACHE_VERSION = 1;
+const LEXICAL_CACHE_VERSION = 2;
 const DEFAULT_EMBED_BASE_URL = "http://127.0.0.1:8129/v1";
 const DEFAULT_EMBED_ENDPOINT = "/embeddings";
 const DEFAULT_EMBED_MODEL = "nomic-embed-text-v1.5";
@@ -287,15 +334,18 @@ function buildChunk(input: {
 	startLine: number;
 	endLine: number;
 	text: string;
+	languageTier?: SemanticSearchLanguageTier;
 	symbolName?: string;
 	symbolKind?: string;
 }): SemanticSearchChunk {
+	const languageTier = input.languageTier ?? "line-window";
 	const symbolHeader =
 		input.symbolName && input.symbolKind ? [`# Symbol: ${input.symbolKind} ${input.symbolName}`] : [];
 	return {
 		id: chunkId(input.path, input.startLine, input.endLine, input.text),
 		path: input.path,
 		language: input.language,
+		languageTier,
 		symbolName: input.symbolName,
 		symbolKind: input.symbolKind,
 		startLine: input.startLine,
@@ -305,10 +355,24 @@ function buildChunk(input: {
 			`# File: ${input.path}`,
 			`# Lines: ${input.startLine}-${input.endLine}`,
 			`# Language: ${input.language}`,
+			`# Language tier: ${languageTier}`,
 			...symbolHeader,
 			input.text,
 		].join("\n"),
 	};
+}
+
+export function buildSemanticSearchChunk(input: {
+	path: string;
+	language: string;
+	startLine: number;
+	endLine: number;
+	text: string;
+	languageTier?: SemanticSearchLanguageTier;
+	symbolName?: string;
+	symbolKind?: string;
+}): SemanticSearchChunk {
+	return buildChunk(input);
 }
 
 export function chunkText(input: ChunkTextInput): SemanticSearchChunk[] {
@@ -317,6 +381,11 @@ export function chunkText(input: ChunkTextInput): SemanticSearchChunk[] {
 	const lines = input.text.replace(/\r?\n$/, "").split(/\r?\n/);
 	if (lines.length === 1 && lines[0] === "") return [];
 	if (input.symbolChunks) {
+		const parserAdapter = createParserAdapterForLanguage(input.language);
+		if (parserAdapter) {
+			const parserResult = parserAdapter.extract({ path: input.path, text: input.text });
+			if (parserResult.chunks.length > 0) return parserResult.chunks;
+		}
 		const symbolChunks = extractSymbolRanges(input.language, lines)
 			.map((range) => {
 				const selected = lines.slice(range.startLine - 1, range.endLine);
@@ -328,6 +397,7 @@ export function chunkText(input: ChunkTextInput): SemanticSearchChunk[] {
 					startLine: range.startLine,
 					endLine: range.endLine,
 					text,
+					languageTier: "structured",
 					symbolName: range.name,
 					symbolKind: range.kind,
 				});
@@ -346,11 +416,12 @@ export function chunkText(input: ChunkTextInput): SemanticSearchChunk[] {
 		const endLine = index + selected.length;
 		chunks.push(
 			buildChunk({
-			path: input.path,
-			language: input.language,
-			startLine,
-			endLine,
-			text,
+				path: input.path,
+				language: input.language,
+				startLine,
+				endLine,
+				text,
+				languageTier: input.languageTier ?? "line-window",
 			}),
 		);
 		if (index + chunkLines >= lines.length) break;
@@ -444,6 +515,29 @@ function scoreDenseChunks(queryEmbedding: number[], chunkEmbeddings: number[][],
 	);
 }
 
+function scoreKey(entry: ScoredChunk): string {
+	return `${entry.chunk.path}\0${entry.chunk.startLine}\0${entry.chunk.endLine}\0${entry.chunk.id}`;
+}
+
+function chunkRevisionKey(chunk: SemanticSearchChunk): string {
+	return `${chunk.path}\0${chunk.startLine}\0${chunk.endLine}\0${chunk.id}`;
+}
+
+function uniqueScoredChunks(entries: ScoredChunk[]): ScoredChunk[] {
+	const byKey = new Map<string, ScoredChunk>();
+	for (const entry of entries) {
+		const key = scoreKey(entry);
+		const existing = byKey.get(key);
+		if (!existing || entry.score > existing.score) {
+			byKey.set(key, entry);
+		}
+	}
+	return [...byKey.values()].sort(
+		(left, right) =>
+			right.score - left.score || left.chunk.path.localeCompare(right.chunk.path) || left.chunk.startLine - right.chunk.startLine,
+	);
+}
+
 function reciprocalRankFuse(dense: ScoredChunk[], lexical: ScoredChunk[], topN: number): ScoredChunk[] {
 	const byId = new Map<string, { chunk: SemanticSearchChunk; score: number }>();
 	const add = (entries: ScoredChunk[], weight: number) => {
@@ -462,6 +556,21 @@ function reciprocalRankFuse(dense: ScoredChunk[], lexical: ScoredChunk[], topN: 
 				right.score - left.score || left.chunk.path.localeCompare(right.chunk.path) || left.chunk.startLine - right.chunk.startLine,
 		)
 		.slice(0, topN);
+}
+
+function computeIndexRevision(chunks: SemanticSearchChunk[]): string {
+	const hash = createHash("sha256");
+	for (const chunk of [...chunks].sort((left, right) => chunkRevisionKey(left).localeCompare(chunkRevisionKey(right)))) {
+		hash.update(chunk.id);
+		hash.update("\0");
+		hash.update(chunk.path);
+		hash.update("\0");
+		hash.update(String(chunk.startLine));
+		hash.update("\0");
+		hash.update(String(chunk.endLine));
+		hash.update("\0");
+	}
+	return hash.digest("hex").slice(0, 12);
 }
 
 export async function embedTexts(input: EmbedTextsInput): Promise<number[][]> {
@@ -699,6 +808,7 @@ async function buildChunks(input: {
 	const nextFiles: Record<string, CachedFileEntry> = {};
 	const chunks: SemanticSearchChunk[] = [];
 	let indexRebuilt = input.reindex || loadedCache === undefined || cache !== loadedCache;
+	let foundStaleCacheState = input.useCache && !input.reindex && loadedCache !== undefined && cache !== loadedCache;
 
 	for (const absolutePath of input.files) {
 		const path = relative(input.root, absolutePath).replaceAll("\\", "/");
@@ -708,6 +818,9 @@ async function buildChunks(input: {
 			nextFiles[path] = cached;
 			chunks.push(...cached.chunks);
 			continue;
+		}
+		if (input.useCache && !input.reindex && loadedCache !== undefined) {
+			foundStaleCacheState = true;
 		}
 
 		const text = await readFile(absolutePath, "utf8");
@@ -724,15 +837,22 @@ async function buildChunks(input: {
 		indexRebuilt = true;
 	}
 
+	if (input.useCache && !input.reindex && loadedCache !== undefined && Object.keys(cache.files).length !== input.files.length) {
+		foundStaleCacheState = true;
+	}
+
 	if (input.useCache && (indexRebuilt || Object.keys(cache.files).length !== Object.keys(nextFiles).length)) {
 		indexRebuilt = true;
 		await saveCache(cachePath, { ...cache, files: nextFiles });
 	}
 
+	const freshness: SemanticSearchFreshness = foundStaleCacheState ? "dirty" : "clean";
 	return {
 		chunks,
 		indexedFiles: input.files.length,
 		indexRebuilt,
+		freshness,
+		indexRevision: computeIndexRevision(chunks),
 		cachePath: input.useCache ? cachePath : undefined,
 	};
 }
@@ -740,6 +860,77 @@ async function buildChunks(input: {
 function snippet(text: string): string {
 	const collapsed = text.replace(/\s+/g, " ").trim();
 	return collapsed.length <= 500 ? collapsed : `${collapsed.slice(0, 497)}...`;
+}
+
+function toSkippedCandidate(entry: ScoredChunk): SemanticSearchSkippedCandidate {
+	return {
+		path: entry.chunk.path,
+		startLine: entry.chunk.startLine,
+		endLine: entry.chunk.endLine,
+		score: Math.round(entry.score * 1000) / 1000,
+		languageTier: entry.chunk.languageTier ?? "line-window",
+		symbolName: entry.chunk.symbolName,
+		symbolKind: entry.chunk.symbolKind,
+	};
+}
+
+function buildReceipt(input: {
+	freshness: SemanticSearchFreshness;
+	indexRevision: string;
+	returned: ScoredChunk[];
+	candidates: ScoredChunk[];
+}): SemanticSearchReceipt {
+	const returnedKeys = new Set(input.returned.map(scoreKey));
+	const skippedCandidates = uniqueScoredChunks(input.candidates)
+		.filter((entry) => !returnedKeys.has(scoreKey(entry)))
+		.map(toSkippedCandidate);
+	const skippedTotal = skippedCandidates.length;
+	if (input.freshness === "dirty") {
+		return {
+			freshness: input.freshness,
+			indexRevision: input.indexRevision,
+			returnedTotal: input.returned.length,
+			skippedTotal,
+			contextComplete: "unknown",
+			contextCompleteReason: "stale_index",
+			recommendedNextAction: "refresh_index",
+			skippedCandidates,
+		};
+	}
+	if (skippedTotal > 0) {
+		return {
+			freshness: input.freshness,
+			indexRevision: input.indexRevision,
+			returnedTotal: input.returned.length,
+			skippedTotal,
+			contextComplete: "incomplete",
+			contextCompleteReason: "candidate_budget_exhausted",
+			recommendedNextAction: "fetch_skipped_candidate",
+			skippedCandidates,
+		};
+	}
+	if (input.returned.length === 0) {
+		return {
+			freshness: input.freshness,
+			indexRevision: input.indexRevision,
+			returnedTotal: 0,
+			skippedTotal: 0,
+			contextComplete: "unknown",
+			contextCompleteReason: "no_matching_candidates",
+			recommendedNextAction: "narrow_query",
+			skippedCandidates: [],
+		};
+	}
+	return {
+		freshness: input.freshness,
+		indexRevision: input.indexRevision,
+		returnedTotal: input.returned.length,
+		skippedTotal: 0,
+		contextComplete: "complete",
+		contextCompleteReason: "returned_all_candidates",
+		recommendedNextAction: "use_bundle",
+		skippedCandidates: [],
+	};
 }
 
 export async function runSemanticSearch(input: SemanticSearchInput): Promise<SemanticSearchOutput> {
@@ -764,8 +955,9 @@ export async function runSemanticSearch(input: SemanticSearchInput): Promise<Sem
 		reindex: input.reindex ?? false,
 	});
 
-	const lexicalScored = scoreChunks(query, indexed.chunks, Math.max(maxResults * 3, maxResults));
+	const lexicalScored = scoreChunks(query, indexed.chunks, indexed.chunks.length);
 	let mode: "lexical" | "hybrid" = "lexical";
+	let candidatePool = lexicalScored;
 	let scored = lexicalScored.slice(0, maxResults);
 	if (input.useEmbeddings && indexed.chunks.length > 0) {
 		try {
@@ -806,7 +998,7 @@ export async function runSemanticSearch(input: SemanticSearchInput): Promise<Sem
 						baseUrl: input.qdrantBaseUrl,
 						collection: input.qdrantCollection,
 						vector: queryEmbedding,
-						limit: Math.max(maxResults * 3, maxResults),
+						limit: indexed.chunks.length,
 					});
 					const chunksById = new Map(indexed.chunks.map((chunk) => [chunk.id, chunk]));
 					const qdrantScored = qdrantHits
@@ -822,7 +1014,8 @@ export async function runSemanticSearch(input: SemanticSearchInput): Promise<Sem
 					warnings.push(`Qdrant path failed (${error instanceof Error ? error.message : String(error)}); using in-memory dense ranking`);
 				}
 			}
-			scored = reciprocalRankFuse(denseScored, lexicalScored, maxResults);
+			candidatePool = reciprocalRankFuse(denseScored, lexicalScored, indexed.chunks.length);
+			scored = candidatePool.slice(0, maxResults);
 			mode = "hybrid";
 		} catch (error) {
 			warnings.push(`embedding path failed (${error instanceof Error ? error.message : String(error)}); falling back to lexical semantic search`);
@@ -842,11 +1035,18 @@ export async function runSemanticSearch(input: SemanticSearchInput): Promise<Sem
 				.map((entry) => ({ chunk: scored[entry.index].chunk, score: entry.score }));
 			if (byIndex.length > 0) {
 				scored = byIndex;
+				candidatePool = uniqueScoredChunks([...byIndex, ...candidatePool]);
 			}
 		} catch (error) {
 			warnings.push(`reranker path failed (${error instanceof Error ? error.message : String(error)}); using non-reranked results`);
 		}
 	}
+	const receipt = buildReceipt({
+		freshness: indexed.freshness,
+		indexRevision: indexed.indexRevision,
+		returned: scored,
+		candidates: candidatePool,
+	});
 	return {
 		query,
 		root,
@@ -855,12 +1055,14 @@ export async function runSemanticSearch(input: SemanticSearchInput): Promise<Sem
 		cachePath: indexed.cachePath,
 		indexedFiles: indexed.indexedFiles,
 		indexedChunks: indexed.chunks.length,
+		receipt,
 		warnings,
 		results: scored.map((entry) => ({
 			path: entry.chunk.path,
 			startLine: entry.chunk.startLine,
 			endLine: entry.chunk.endLine,
 			score: Math.round(entry.score * 1000) / 1000,
+			languageTier: entry.chunk.languageTier ?? "line-window",
 			symbolName: entry.chunk.symbolName,
 			symbolKind: entry.chunk.symbolKind,
 			snippet: snippet(entry.chunk.text),
@@ -947,6 +1149,7 @@ export function createSemanticSearchTool(cwd: string): AgentTool<typeof semantic
 			});
 			const lines = [
 				`semantic_search mode=${result.mode} indexed_files=${result.indexedFiles} indexed_chunks=${result.indexedChunks}`,
+				`receipt freshness=${result.receipt.freshness} revision=${result.receipt.indexRevision} complete=${result.receipt.contextComplete} next=${result.receipt.recommendedNextAction} returned=${result.receipt.returnedTotal} skipped=${result.receipt.skippedTotal}`,
 				...result.results.map(
 					(entry) =>
 						`- ${entry.path}:${entry.startLine}-${entry.endLine} score=${entry.score.toFixed(3)} ${entry.snippet}`,

@@ -137,7 +137,7 @@ async function main() {
 	const plannerProfile = getQwen36Profile("planner");
 	const executorProfile = getQwen36Profile("executor");
 	const agent = new Agent({
-		streamFunction: streamSimple,
+		streamFn: streamSimple,
 		getApiKey: () => "local",
 		onPayload: (payload) => {
 			const profile = getQwen36Profile(currentMode);

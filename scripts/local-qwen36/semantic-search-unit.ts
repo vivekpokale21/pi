@@ -15,6 +15,7 @@ import {
 	runSemanticSearch,
 	upsertQdrantVectors,
 } from "./semantic-search.ts";
+import { createTypeScriptParserAdapter } from "./parser-adapters.ts";
 import { EXECUTOR_TOOL_NAMES, isPlannerToolAllowed, PLANNER_TOOL_NAMES } from "./read-only.ts";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
@@ -177,14 +178,75 @@ function chunksTextBySymbolsWhenEnabled(): void {
 		symbolChunks: true,
 	});
 
-	assert.equal(chunks.length, 2);
+	assert.equal(chunks.length, 3);
 	assert.equal(chunks[0].symbolName, "AuthService");
 	assert.equal(chunks[0].symbolKind, "class");
+	assert.equal(chunks[0].languageTier, "structured");
 	assert.equal(chunks[0].startLine, 1);
 	assert.equal(chunks[0].endLine, 5);
 	assert.match(chunks[0].textWithHeader, /# Symbol: class AuthService/);
-	assert.equal(chunks[1].symbolName, "validateToken");
-	assert.equal(chunks[1].symbolKind, "function");
+	assert.equal(chunks[1].symbolName, "AuthService.login");
+	assert.equal(chunks[1].symbolKind, "method");
+	assert.equal(chunks[2].symbolName, "validateToken");
+	assert.equal(chunks[2].symbolKind, "function");
+}
+
+function typeScriptParserExtractsSymbolsImportsAndTier(): void {
+	const adapter = createTypeScriptParserAdapter();
+	const result = adapter.extract({
+		path: "src/service.ts",
+		text: [
+			"import { readCredential } from './credentials';",
+			"import logger from '../logger';",
+			"",
+			"export interface AuthConfig {",
+			"  token: string;",
+			"}",
+			"",
+			"export class AuthService {",
+			"  login() {",
+			"    return readCredential();",
+			"  }",
+			"}",
+			"",
+			"export function validateToken(token: string) {",
+			"  return token.length > 10;",
+			"}",
+		].join("\n"),
+	});
+
+	assert.deepEqual(result.warnings, []);
+	assert.deepEqual(
+		result.chunks.map((chunk) => [chunk.symbolKind, chunk.symbolName, chunk.startLine, chunk.endLine, chunk.languageTier]),
+		[
+			["interface", "AuthConfig", 4, 6, "structured"],
+			["class", "AuthService", 8, 12, "structured"],
+			["method", "AuthService.login", 9, 11, "structured"],
+			["function", "validateToken", 14, 16, "structured"],
+		],
+	);
+	assert.deepEqual(
+		result.imports.map((edge) => [edge.fromPath, edge.specifier, edge.kind, edge.confidence]),
+		[
+			["src/service.ts", "./credentials", "static", "high"],
+			["src/service.ts", "../logger", "static", "high"],
+		],
+	);
+	assert.match(result.chunks[0]?.textWithHeader ?? "", /# Language tier: structured/);
+}
+
+function parserAdapterFallsBackToLineWindowOnParseFailure(): void {
+	const adapter = createTypeScriptParserAdapter();
+	const result = adapter.extract({
+		path: "src/broken.ts",
+		text: "export function broken(\n",
+	});
+
+	assert.equal(result.chunks.length, 1);
+	assert.equal(result.chunks[0]?.languageTier, "line-window");
+	assert.equal(result.chunks[0]?.symbolName, undefined);
+	assert.equal(result.imports.length, 0);
+	assert.match(result.warnings[0] ?? "", /parser failed/);
 }
 
 async function lexicalSearchRanksExpectedChunk(): Promise<void> {
@@ -249,8 +311,41 @@ async function symbolChunkSearchReturnsSymbolMetadata(): Promise<void> {
 			symbolChunks: true,
 		});
 		assert.equal(result.results[0]?.path, "src/service.ts");
-		assert.equal(result.results[0]?.symbolName, "AuthService");
-		assert.equal(result.results[0]?.symbolKind, "class");
+		assert.equal(result.results[0]?.symbolName, "AuthService.login");
+		assert.equal(result.results[0]?.symbolKind, "method");
+		assert.equal(result.results[0]?.languageTier, "structured");
+	});
+}
+
+async function semanticSearchUsesParserChunksWhenAvailable(): Promise<void> {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "src"), { recursive: true });
+		await writeFile(
+			join(dir, "src", "service.ts"),
+			[
+				"export class AuthService {",
+				"  login() {",
+				"    return readCredential();",
+				"  }",
+				"}",
+				"",
+				"export function drawCanvas() {",
+				"  return true;",
+				"}",
+			].join("\n"),
+			"utf8",
+		);
+
+		const result = await runSemanticSearch({
+			root: dir,
+			query: "login credential",
+			extensions: ["ts"],
+			symbolChunks: true,
+		});
+		assert.equal(result.results[0]?.path, "src/service.ts");
+		assert.equal(result.results[0]?.symbolName, "AuthService.login");
+		assert.equal(result.results[0]?.symbolKind, "method");
+		assert.equal(result.results[0]?.languageTier, "structured");
 	});
 }
 
@@ -271,8 +366,9 @@ async function persistentCacheReusesAndRefreshesIndex(): Promise<void> {
 		assert.equal(first.cachePath.endsWith(".semantic_search/lexical-index.json"), true);
 		assert.equal(first.results[0]?.path, "src/auth.ts");
 		const cacheRaw = JSON.parse(await readFile(join(dir, ".semantic_search", "lexical-index.json"), "utf8"));
-		assert.equal(cacheRaw.version, 1);
+		assert.equal(cacheRaw.version, 2);
 		assert.equal(cacheRaw.files["src/auth.ts"].chunks.length, 1);
+		assert.equal(cacheRaw.files["src/auth.ts"].chunks[0].languageTier, "line-window");
 
 		const second = await runSemanticSearch({
 			root: dir,
@@ -296,6 +392,92 @@ async function persistentCacheReusesAndRefreshesIndex(): Promise<void> {
 	});
 }
 
+async function searchReceiptReportsFreshnessAndRevision(): Promise<void> {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "src"), { recursive: true });
+		const alphaPath = join(dir, "src", "alpha.ts");
+		await writeFile(alphaPath, "export const alphaToken = 'alpha';\n", "utf8");
+
+		const uncached = await runSemanticSearch({
+			root: dir,
+			query: "alpha token",
+			extensions: ["ts"],
+			useCache: false,
+		});
+		assert.match(uncached.receipt.indexRevision, /^[a-f0-9]{12}$/);
+		assert.equal(uncached.receipt.freshness, "clean");
+		assert.equal(uncached.receipt.returnedTotal, uncached.results.length);
+		assert.equal(uncached.receipt.contextComplete, "complete");
+		assert.equal(uncached.receipt.recommendedNextAction, "use_bundle");
+
+		const indexed = await runSemanticSearch({
+			root: dir,
+			query: "alpha token",
+			extensions: ["ts"],
+			useCache: true,
+			reindex: true,
+		});
+		assert.equal(indexed.receipt.indexRevision, uncached.receipt.indexRevision);
+		assert.equal(indexed.receipt.freshness, "clean");
+
+		const cached = await runSemanticSearch({
+			root: dir,
+			query: "alpha token",
+			extensions: ["ts"],
+			useCache: true,
+		});
+		assert.equal(cached.indexRebuilt, false);
+		assert.equal(cached.receipt.indexRevision, indexed.receipt.indexRevision);
+		assert.equal(cached.receipt.freshness, "clean");
+
+		await writeFile(alphaPath, "export const betaToken = 'beta';\n", "utf8");
+		const dirty = await runSemanticSearch({
+			root: dir,
+			query: "beta token",
+			extensions: ["ts"],
+			useCache: true,
+		});
+		assert.equal(dirty.receipt.freshness, "dirty");
+		assert.notEqual(dirty.receipt.indexRevision, cached.receipt.indexRevision);
+		assert.equal(dirty.receipt.recommendedNextAction, "refresh_index");
+
+		const refreshed = await runSemanticSearch({
+			root: dir,
+			query: "beta token",
+			extensions: ["ts"],
+			useCache: true,
+			reindex: true,
+		});
+		assert.equal(refreshed.receipt.freshness, "clean");
+		assert.equal(refreshed.receipt.indexRevision, dirty.receipt.indexRevision);
+	});
+}
+
+async function searchReceiptAccountsForSkippedCandidates(): Promise<void> {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "src"), { recursive: true });
+		await writeFile(join(dir, "src", "first.ts"), "export const sharedTokenOne = 'shared token';\n", "utf8");
+		await writeFile(join(dir, "src", "second.ts"), "export const sharedTokenTwo = 'shared token';\n", "utf8");
+		await writeFile(join(dir, "src", "third.ts"), "export const sharedTokenThree = 'shared token';\n", "utf8");
+
+		const result = await runSemanticSearch({
+			root: dir,
+			query: "shared token",
+			extensions: ["ts"],
+			maxResults: 1,
+		});
+
+		assert.equal(result.results.length, 1);
+		assert.equal(result.receipt.returnedTotal, 1);
+		assert.equal(result.receipt.skippedTotal, 2);
+		assert.equal(result.receipt.skippedCandidates.length, 2);
+		assert.equal(result.receipt.contextComplete, "incomplete");
+		assert.equal(result.receipt.contextCompleteReason, "candidate_budget_exhausted");
+		assert.equal(result.receipt.recommendedNextAction, "fetch_skipped_candidate");
+		assert.match(result.receipt.skippedCandidates[0]?.path ?? "", /^src\//);
+	});
+}
+
 function normalizesExtensions(): void {
 	assert.deepEqual(normalizeExtensions(["ts", ".tsx", "TS"]), [".ts", ".tsx"]);
 	assert.equal(normalizeExtensions([]).includes(".md"), true);
@@ -309,7 +491,9 @@ async function toolRejectsWorkspaceEscapesAndReturnsResults(): Promise<void> {
 
 		const result = await tool.execute("call-1", { query: "auth token", path: "src", maxResults: 2 });
 		assert.equal(result.details.results.length, 1);
-		assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /auth.ts:1-1/);
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+		assert.match(text, /^semantic_search mode=lexical indexed_files=1 indexed_chunks=1\nreceipt freshness=clean revision=[a-f0-9]{12} complete=complete next=use_bundle returned=1 skipped=0/m);
+		assert.match(text, /auth.ts:1-1/);
 
 		await assert.rejects(
 			() => tool.execute("call-2", { query: "auth", path: resolve(dir, ".."), maxResults: 2 }),
@@ -530,10 +714,15 @@ assert.equal(PLANNER_TOOL_NAMES.includes("semantic_search"), true);
 assert.equal(EXECUTOR_TOOL_NAMES.includes("semantic_search"), true);
 chunksTextWithOverlap();
 chunksTextBySymbolsWhenEnabled();
+typeScriptParserExtractsSymbolsImportsAndTier();
+parserAdapterFallsBackToLineWindowOnParseFailure();
 normalizesExtensions();
 await lexicalSearchRanksExpectedChunk();
 await symbolChunkSearchReturnsSymbolMetadata();
+await semanticSearchUsesParserChunksWhenAvailable();
 await persistentCacheReusesAndRefreshesIndex();
+await searchReceiptReportsFreshnessAndRevision();
+await searchReceiptAccountsForSkippedCandidates();
 await toolRejectsWorkspaceEscapesAndReturnsResults();
 await embedsTextsInInputOrder();
 await denseSearchRanksSemanticHitAndFallsBackOnFailure();
