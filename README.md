@@ -18,6 +18,22 @@ This is the home of the Pi agent harness project including our self extensible c
 * **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
 * **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
 
+## Local Qwen 3.6 Harness
+
+This fork keeps the stock Pi package names and project identity, but adds a local harness under [`scripts/local-qwen36`](scripts/local-qwen36) for testing Pi against a fixed llama.cpp-served Qwen 3.6 setup.
+
+The current target is Qwen3.6-35B-A3B running through llama.cpp's OpenAI-compatible server, using the `Qwen3.6-35B-A3B-IQ4_XS-4.15bpw.gguf` profile with a 131k context window. The local performance target is roughly 550 tokens/s prompt processing and 25 tokens/s token generation on the current ByteShape GPU-5 setup.
+
+Compared with stock Pi, the local harness adds:
+
+- a fixed Qwen 3.6 llama.cpp launcher with dry-run validation;
+- planner/executor profile switching on one Pi `Agent`, including different sampler and thinking settings;
+- executor-only deterministic `apply_diff` with dry-run patch validation;
+- crash-loop backoff for the local llama.cpp server;
+- hierarchical working/persistent memory blocks for repeated local sessions;
+- read-only `lsp_symbols` and `semantic_search` tools for planner and executor context;
+- optional local embeddings, HyDE, rerank, and Qdrant-compatible vector search paths for retrieval experiments.
+
 To learn more about Pi:
 
 * [Visit pi.dev](https://pi.dev), the project website with demos
