@@ -36,9 +36,70 @@ interface DryRunFile {
 	deletesFile: boolean;
 }
 
+interface HunkHeader {
+	oldStart: number;
+	oldLines: number;
+	newStart: number;
+	newLines: number;
+}
+
 function stripDiffPrefix(fileName: string): string {
 	if (fileName.startsWith("a/") || fileName.startsWith("b/")) return fileName.slice(2);
 	return fileName;
+}
+
+function parseHunkHeader(line: string): HunkHeader | undefined {
+	const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+	if (!match) return undefined;
+	return {
+		oldStart: Number(match[1]),
+		oldLines: Number(match[2] ?? "1"),
+		newStart: Number(match[3]),
+		newLines: Number(match[4] ?? "1"),
+	};
+}
+
+function normalizePatchFileName(fileName: string): string {
+	return stripDiffPrefix(fileName.trim());
+}
+
+function assertPatchHunkCounts(patchText: string): void {
+	const lines = patchText.split(/\r?\n/);
+	let currentFile = "";
+	for (let index = 0; index < lines.length; index += 1) {
+		const line = lines[index];
+		if (line.startsWith("+++ ")) {
+			currentFile = normalizePatchFileName(line.slice(4));
+			continue;
+		}
+		const header = parseHunkHeader(line);
+		if (!header) continue;
+
+		let oldCount = 0;
+		let newCount = 0;
+		for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+			const bodyLine = lines[cursor];
+			if (bodyLine.startsWith("@@ ") || bodyLine.startsWith("--- ") || bodyLine.startsWith("+++ ")) break;
+			if (bodyLine.length === 0) continue;
+			if (bodyLine.startsWith("+")) {
+				newCount += 1;
+			} else if (bodyLine.startsWith("-")) {
+				oldCount += 1;
+			} else if (bodyLine.startsWith(" ")) {
+				oldCount += 1;
+				newCount += 1;
+			}
+		}
+
+		if (header.oldLines === 0 && header.newLines !== newCount) {
+			throw new Error(`new file hunk for ${currentFile} declares ${header.newLines} added lines but contains ${newCount} added lines`);
+		}
+		if (header.oldLines !== oldCount || header.newLines !== newCount) {
+			throw new Error(
+				`hunk for ${currentFile} declares -${header.oldLines}/+${header.newLines} lines but contains -${oldCount}/+${newCount} lines`,
+			);
+		}
+	}
 }
 
 function selectPatchPath(patch: ParsedDiff): { path: string; deletesFile: boolean } {
@@ -135,6 +196,7 @@ async function readTextFileForPatch(path: string): Promise<string> {
 
 export async function applyUnifiedDiff(input: { cwd: string; patch: string }): Promise<ApplyUnifiedDiffResult> {
 	if (input.patch.trim().length === 0) throw new Error("patch must not be empty");
+	assertPatchHunkCounts(input.patch);
 
 	const planned = await planPatches(input.cwd, input.patch);
 	const byPath = new Map<string, PlannedPatch[]>();

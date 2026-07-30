@@ -109,7 +109,7 @@ export function createLocalQwen36Model(modelId: string, baseUrl: string): Model<
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: Number(process.env.QWEN36_CTX ?? "131072"),
-		maxTokens: Number(process.env.QWEN36_SMOKE_MAX_TOKENS ?? "512"),
+		maxTokens: Number(process.env.QWEN36_MAX_TOKENS ?? process.env.QWEN36_SMOKE_MAX_TOKENS ?? "0"),
 		compat: {
 			supportsDeveloperRole: false,
 			supportsReasoningEffort: false,

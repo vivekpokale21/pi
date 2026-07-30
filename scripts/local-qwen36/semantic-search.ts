@@ -69,6 +69,14 @@ export interface SemanticSearchReceipt {
 	skippedCandidates: SemanticSearchSkippedCandidate[];
 }
 
+export interface SemanticSearchEmbeddingStats {
+	encodeQueryCalls: number;
+	encodeDocumentCalls: number;
+	encodedDocumentCount: number;
+	embeddingRequestCount: number;
+	embeddingMs: number;
+}
+
 export interface SemanticSearchOutput {
 	query: string;
 	root: string;
@@ -77,10 +85,13 @@ export interface SemanticSearchOutput {
 	cachePath?: string;
 	indexedFiles: number;
 	indexedChunks: number;
+	embeddingStats: SemanticSearchEmbeddingStats;
 	receipt: SemanticSearchReceipt;
 	results: SemanticSearchResult[];
 	warnings: string[];
 }
+
+export type SemanticSearchEmbeddingProfile = "default" | "coderank";
 
 export interface ChunkTextInput {
 	path: string;
@@ -95,6 +106,7 @@ export interface ChunkTextInput {
 export interface SemanticSearchInput {
 	root: string;
 	query: string;
+	scopedFile?: string;
 	extensions?: string[];
 	maxResults?: number;
 	chunkLines?: number;
@@ -104,6 +116,7 @@ export interface SemanticSearchInput {
 	reindex?: boolean;
 	symbolChunks?: boolean;
 	useEmbeddings?: boolean;
+	embeddingProfile?: SemanticSearchEmbeddingProfile;
 	embedBaseUrl?: string;
 	embedEndpoint?: string;
 	embedModel?: string;
@@ -201,6 +214,17 @@ interface LexicalIndexCache {
 	files: Record<string, CachedFileEntry>;
 }
 
+interface CachedEmbeddingEntry {
+	vector: number[];
+}
+
+interface EmbeddingIndexCache {
+	version: 1;
+	root: string;
+	model: string;
+	entries: Record<string, CachedEmbeddingEntry>;
+}
+
 interface IndexedChunks {
 	chunks: SemanticSearchChunk[];
 	indexedFiles: number;
@@ -215,14 +239,31 @@ const DEFAULT_CHUNK_OVERLAP_LINES = 20;
 const DEFAULT_MAX_RESULTS = 8;
 const DEFAULT_MAX_FILE_SIZE_BYTES = 512 * 1024;
 const LEXICAL_CACHE_VERSION = 2;
+const EMBEDDING_CACHE_VERSION = 1;
 const DEFAULT_EMBED_BASE_URL = "http://127.0.0.1:8129/v1";
 const DEFAULT_EMBED_ENDPOINT = "/embeddings";
 const DEFAULT_EMBED_MODEL = "nomic-embed-text-v1.5";
+const CODERANK_EMBED_MODEL = "nomic-ai/CodeRankEmbed";
+const CODERANK_QUERY_PREFIX = "Represent this query for searching relevant code:";
 const DEFAULT_HYDE_ENDPOINT = "/completions";
 const DEFAULT_HYDE_MODEL = "qwen3.6-hyde";
 const DEFAULT_RERANK_ENDPOINT = "/rerank";
 const DEFAULT_RERANK_MODEL = "qwen3.6-rerank";
-const IGNORED_DIRECTORIES = new Set([".git", "node_modules", "dist", "build", "target", ".port_sessions", ".semantic_search"]);
+const IGNORED_DIRECTORIES = new Set([
+	".git",
+	".mypy_cache",
+	".port_sessions",
+	".pytest_cache",
+	".ruff_cache",
+	".semantic_search",
+	".venv",
+	"__pycache__",
+	"build",
+	"dist",
+	"node_modules",
+	"target",
+	"venv",
+]);
 const DEFAULT_EXTENSIONS = [
 	".rs",
 	".py",
@@ -708,7 +749,20 @@ export async function queryQdrantVectors(input: QueryQdrantVectorsInput): Promis
 		.filter((entry): entry is QdrantVectorHit => typeof entry.chunkId === "string" && typeof entry.score === "number");
 }
 
-async function collectFiles(root: string, allowedExtensions: Set<string>, maxFileSizeBytes: number): Promise<string[]> {
+async function collectFiles(
+	root: string,
+	allowedExtensions: Set<string>,
+	maxFileSizeBytes: number,
+	scopedFile?: string,
+): Promise<string[]> {
+	if (scopedFile) {
+		const absolutePath = resolve(root, scopedFile);
+		const info = await stat(absolutePath);
+		if (!info.isFile()) return [];
+		if (!allowedExtensions.has(extname(scopedFile).toLowerCase())) return [];
+		if (info.size > maxFileSizeBytes) return [];
+		return [absolutePath];
+	}
 	const files: string[] = [];
 	async function visit(directory: string): Promise<void> {
 		const entries = await readdir(directory, { withFileTypes: true });
@@ -750,6 +804,36 @@ async function loadCache(cachePath: string): Promise<LexicalIndexCache | undefin
 }
 
 async function saveCache(cachePath: string, cache: LexicalIndexCache): Promise<void> {
+	await mkdir(resolve(cachePath, ".."), { recursive: true });
+	await writeFile(cachePath, `${JSON.stringify(cache, null, 2)}\n`, "utf8");
+}
+
+async function loadEmbeddingCache(cachePath: string): Promise<EmbeddingIndexCache | undefined> {
+	try {
+		const parsed = JSON.parse(await readFile(cachePath, "utf8"));
+		if (
+			parsed?.version !== EMBEDDING_CACHE_VERSION ||
+			typeof parsed.root !== "string" ||
+			typeof parsed.model !== "string" ||
+			typeof parsed.entries !== "object"
+		) {
+			return undefined;
+		}
+		return parsed as EmbeddingIndexCache;
+	} catch (error) {
+		if (
+			typeof error === "object" &&
+			error !== null &&
+			"code" in error &&
+			(error.code === "ENOENT" || error.code === "ENOTDIR")
+		) {
+			return undefined;
+		}
+		throw error;
+	}
+}
+
+async function saveEmbeddingCache(cachePath: string, cache: EmbeddingIndexCache): Promise<void> {
 	await mkdir(resolve(cachePath, ".."), { recursive: true });
 	await writeFile(cachePath, `${JSON.stringify(cache, null, 2)}\n`, "utf8");
 }
@@ -933,6 +1017,107 @@ function buildReceipt(input: {
 	};
 }
 
+function embeddingCachePath(root: string): string {
+	return resolve(root, ".semantic_search", "embedding-index.json");
+}
+
+function emptyEmbeddingStats(): SemanticSearchEmbeddingStats {
+	return {
+		encodeQueryCalls: 0,
+		encodeDocumentCalls: 0,
+		encodedDocumentCount: 0,
+		embeddingRequestCount: 0,
+		embeddingMs: 0,
+	};
+}
+
+function normalizeEmbeddingModel(input: SemanticSearchInput, profile: SemanticSearchEmbeddingProfile): string {
+	return input.embedModel ?? (profile === "coderank" ? CODERANK_EMBED_MODEL : DEFAULT_EMBED_MODEL);
+}
+
+function applyEmbeddingQueryPrefix(query: string, profile: SemanticSearchEmbeddingProfile): string {
+	return profile === "coderank" ? `${CODERANK_QUERY_PREFIX} ${query}` : query;
+}
+
+async function prepareDocumentEmbeddings(input: {
+	root: string;
+	chunks: SemanticSearchChunk[];
+	model: string;
+	baseUrl: string;
+	endpoint: string | undefined;
+	useCache: boolean;
+	reindex: boolean;
+	stats: SemanticSearchEmbeddingStats;
+}): Promise<Map<string, number[]>> {
+	const cachePath = embeddingCachePath(input.root);
+	if (input.reindex) {
+		await rm(cachePath, { force: true });
+	}
+	const loadedCache = input.useCache ? await loadEmbeddingCache(cachePath) : undefined;
+	const cache =
+		loadedCache?.root === input.root && loadedCache.model === input.model
+			? loadedCache
+			: {
+					version: EMBEDDING_CACHE_VERSION,
+					root: input.root,
+					model: input.model,
+					entries: {},
+				};
+	const nextEntries: Record<string, CachedEmbeddingEntry> = { ...cache.entries };
+	const missingChunks: SemanticSearchChunk[] = [];
+
+	for (const chunk of input.chunks) {
+		const cached = cache.entries[chunk.id];
+		if (cached && Array.isArray(cached.vector) && cached.vector.every((value) => typeof value === "number")) {
+			continue;
+		}
+		missingChunks.push(chunk);
+	}
+
+	if (missingChunks.length > 0) {
+		const started = Date.now();
+		const vectors = await embedTexts({
+			baseUrl: input.baseUrl,
+			endpoint: input.endpoint,
+			model: input.model,
+			texts: missingChunks.map((chunk) => chunk.textWithHeader),
+		});
+		input.stats.encodeDocumentCalls += 1;
+		input.stats.embeddingRequestCount += 1;
+		input.stats.encodedDocumentCount += missingChunks.length;
+		input.stats.embeddingMs += Date.now() - started;
+		for (let index = 0; index < missingChunks.length; index += 1) {
+			nextEntries[missingChunks[index].id] = { vector: vectors[index] ?? [] };
+		}
+	}
+
+	if (input.useCache && (missingChunks.length > 0 || loadedCache !== cache)) {
+		await saveEmbeddingCache(cachePath, { ...cache, entries: nextEntries });
+	}
+
+	return new Map(input.chunks.map((chunk) => [chunk.id, nextEntries[chunk.id]?.vector ?? []]));
+}
+
+async function embedQuery(input: {
+	baseUrl: string;
+	endpoint: string | undefined;
+	model: string;
+	query: string;
+	stats: SemanticSearchEmbeddingStats;
+}): Promise<number[]> {
+	const started = Date.now();
+	const embeddings = await embedTexts({
+		baseUrl: input.baseUrl,
+		endpoint: input.endpoint,
+		model: input.model,
+		texts: [input.query],
+	});
+	input.stats.encodeQueryCalls += 1;
+	input.stats.embeddingRequestCount += 1;
+	input.stats.embeddingMs += Date.now() - started;
+	return embeddings[0] ?? [];
+}
+
 export async function runSemanticSearch(input: SemanticSearchInput): Promise<SemanticSearchOutput> {
 	const query = input.query.trim();
 	if (!query) throw new Error("query must not be empty");
@@ -942,8 +1127,9 @@ export async function runSemanticSearch(input: SemanticSearchInput): Promise<Sem
 	const chunkLines = Math.max(1, input.chunkLines ?? DEFAULT_CHUNK_LINES);
 	const chunkOverlapLines = Math.max(0, input.chunkOverlapLines ?? DEFAULT_CHUNK_OVERLAP_LINES);
 	const maxFileSizeBytes = Math.max(1, input.maxFileSizeBytes ?? DEFAULT_MAX_FILE_SIZE_BYTES);
-	const files = await collectFiles(root, new Set(extensions), maxFileSizeBytes);
+	const files = await collectFiles(root, new Set(extensions), maxFileSizeBytes, input.scopedFile);
 	const warnings: string[] = [];
+	const embeddingStats = emptyEmbeddingStats();
 	const indexed = await buildChunks({
 		root,
 		files,
@@ -962,10 +1148,13 @@ export async function runSemanticSearch(input: SemanticSearchInput): Promise<Sem
 	if (input.useEmbeddings && indexed.chunks.length > 0) {
 		try {
 			let queryForEmbedding = query;
+			const embeddingProfile = input.embeddingProfile ?? "default";
+			const embedModel = normalizeEmbeddingModel(input, embeddingProfile);
+			const embedBaseUrl = input.embedBaseUrl ?? DEFAULT_EMBED_BASE_URL;
 			if (input.useHyde) {
 				try {
 					queryForEmbedding = await expandQueryWithHyde({
-						baseUrl: input.hydeBaseUrl ?? input.embedBaseUrl ?? DEFAULT_EMBED_BASE_URL,
+						baseUrl: input.hydeBaseUrl ?? embedBaseUrl,
 						endpoint: input.hydeEndpoint,
 						model: input.hydeModel ?? DEFAULT_HYDE_MODEL,
 						query,
@@ -974,23 +1163,36 @@ export async function runSemanticSearch(input: SemanticSearchInput): Promise<Sem
 					warnings.push(`HyDE completion failed (${error instanceof Error ? error.message : String(error)}); using plain query embedding`);
 				}
 			}
-			const embeddings = await embedTexts({
-				baseUrl: input.embedBaseUrl ?? DEFAULT_EMBED_BASE_URL,
+			const documentEmbeddingsByChunkId = await prepareDocumentEmbeddings({
+				root,
+				chunks: indexed.chunks,
+				model: embedModel,
+				baseUrl: embedBaseUrl,
 				endpoint: input.embedEndpoint,
-				model: input.embedModel ?? DEFAULT_EMBED_MODEL,
-				texts: [queryForEmbedding, ...indexed.chunks.map((chunk) => chunk.textWithHeader)],
+				useCache: input.useCache ?? false,
+				reindex: input.reindex ?? false,
+				stats: embeddingStats,
 			});
-			const queryEmbedding = embeddings[0] ?? [];
-			let denseScored = scoreDenseChunks(queryEmbedding, embeddings.slice(1), indexed.chunks);
+			const queryEmbedding = await embedQuery({
+				baseUrl: embedBaseUrl,
+				endpoint: input.embedEndpoint,
+				model: embedModel,
+				query: applyEmbeddingQueryPrefix(queryForEmbedding, embeddingProfile),
+				stats: embeddingStats,
+			});
+			let denseScored = scoreDenseChunks(
+				queryEmbedding,
+				indexed.chunks.map((chunk) => documentEmbeddingsByChunkId.get(chunk.id) ?? []),
+				indexed.chunks,
+			);
 			if (input.qdrantBaseUrl && input.qdrantCollection) {
 				try {
-					const chunkEmbeddings = embeddings.slice(1);
 					await upsertQdrantVectors({
 						baseUrl: input.qdrantBaseUrl,
 						collection: input.qdrantCollection,
-						points: indexed.chunks.map((chunk, index) => ({
+						points: indexed.chunks.map((chunk) => ({
 							id: chunk.id,
-							vector: chunkEmbeddings[index] ?? [],
+							vector: documentEmbeddingsByChunkId.get(chunk.id) ?? [],
 							payload: { chunkId: chunk.id },
 						})),
 					});
@@ -1055,6 +1257,7 @@ export async function runSemanticSearch(input: SemanticSearchInput): Promise<Sem
 		cachePath: indexed.cachePath,
 		indexedFiles: indexed.indexedFiles,
 		indexedChunks: indexed.chunks.length,
+		embeddingStats,
 		receipt,
 		warnings,
 		results: scored.map((entry) => ({
@@ -1074,7 +1277,7 @@ function isWithinWorkspace(candidate: string, workspaceRoot: string): boolean {
 	return candidate === workspaceRoot || candidate.startsWith(`${workspaceRoot}${sep}`);
 }
 
-async function resolveSearchRoot(cwd: string, path: string | undefined): Promise<string> {
+async function resolveSearchScope(cwd: string, path: string | undefined): Promise<{ root: string; scopedFile?: string }> {
 	const workspaceRoot = await realpath(cwd);
 	const rawPath = path?.trim();
 	const absolutePath = rawPath ? (isAbsolute(rawPath) ? rawPath : resolve(workspaceRoot, rawPath)) : workspaceRoot;
@@ -1082,7 +1285,11 @@ async function resolveSearchRoot(cwd: string, path: string | undefined): Promise
 	if (!isWithinWorkspace(resolvedPath, workspaceRoot)) {
 		throw new Error(`path escapes workspace: ${path}`);
 	}
-	return resolvedPath;
+	const info = await stat(resolvedPath);
+	if (info.isFile()) {
+		return { root: workspaceRoot, scopedFile: relative(workspaceRoot, resolvedPath).replaceAll("\\", "/") };
+	}
+	return { root: resolvedPath };
 }
 
 const semanticSearchSchema = Type.Object({
@@ -1096,6 +1303,12 @@ const semanticSearchSchema = Type.Object({
 	useCache: Type.Optional(Type.Boolean({ description: "Persist and reuse a local lexical index cache." })),
 	reindex: Type.Optional(Type.Boolean({ description: "Force rebuilding the local lexical index cache." })),
 	useEmbeddings: Type.Optional(Type.Boolean({ description: "Use local embeddings and hybrid dense/lexical retrieval." })),
+	embeddingProfile: Type.Optional(
+		Type.Union([
+			Type.Literal("default", { description: "Use the default embedding behavior." }),
+			Type.Literal("coderank", { description: "Use CodeRankEmbed query instructions and model default." }),
+		]),
+	),
 	embedBaseUrl: Type.Optional(Type.String({ description: "OpenAI-compatible embeddings base URL." })),
 	embedEndpoint: Type.Optional(Type.String({ description: "Embeddings endpoint path." })),
 	embedModel: Type.Optional(Type.String({ description: "Embeddings model name." })),
@@ -1113,7 +1326,14 @@ const semanticSearchSchema = Type.Object({
 
 type SemanticSearchParams = Static<typeof semanticSearchSchema>;
 
-export function createSemanticSearchTool(cwd: string): AgentTool<typeof semanticSearchSchema, SemanticSearchOutput> {
+export type SemanticSearchToolDefaults = Partial<
+	Pick<SemanticSearchInput, "useCache" | "useEmbeddings" | "embeddingProfile" | "embedBaseUrl" | "embedEndpoint" | "embedModel">
+>;
+
+export function createSemanticSearchTool(
+	cwd: string,
+	defaults: SemanticSearchToolDefaults = {},
+): AgentTool<typeof semanticSearchSchema, SemanticSearchOutput> {
 	return {
 		label: "Semantic search",
 		name: "semantic_search",
@@ -1121,21 +1341,23 @@ export function createSemanticSearchTool(cwd: string): AgentTool<typeof semantic
 		parameters: semanticSearchSchema,
 		executionMode: "parallel",
 		execute: async (_toolCallId: string, params: SemanticSearchParams) => {
-			const root = await resolveSearchRoot(cwd, params.path);
+			const scope = await resolveSearchScope(cwd, params.path);
 			const result = await runSemanticSearch({
-				root,
+				root: scope.root,
+				scopedFile: scope.scopedFile,
 				query: params.query,
 				extensions: params.extensions,
 				maxResults: params.maxResults,
 				chunkLines: params.chunkLines,
 				chunkOverlapLines: params.chunkOverlapLines,
 				symbolChunks: params.symbolChunks,
-				useCache: params.useCache,
+				useCache: params.useCache ?? defaults.useCache,
 				reindex: params.reindex,
-				useEmbeddings: params.useEmbeddings,
-				embedBaseUrl: params.embedBaseUrl,
-				embedEndpoint: params.embedEndpoint,
-				embedModel: params.embedModel,
+				useEmbeddings: params.useEmbeddings ?? defaults.useEmbeddings,
+				embeddingProfile: params.embeddingProfile ?? defaults.embeddingProfile,
+				embedBaseUrl: params.embedBaseUrl ?? defaults.embedBaseUrl,
+				embedEndpoint: params.embedEndpoint ?? defaults.embedEndpoint,
+				embedModel: params.embedModel ?? defaults.embedModel,
 				useHyde: params.useHyde,
 				hydeBaseUrl: params.hydeBaseUrl,
 				hydeEndpoint: params.hydeEndpoint,

@@ -253,6 +253,7 @@ async function lexicalSearchRanksExpectedChunk(): Promise<void> {
 	await withTempDir(async (dir) => {
 		await mkdir(join(dir, "src"), { recursive: true });
 		await mkdir(join(dir, "node_modules", "ignored"), { recursive: true });
+		await mkdir(join(dir, ".venv", "lib"), { recursive: true });
 		await writeFile(
 			join(dir, "src", "auth.ts"),
 			[
@@ -267,6 +268,7 @@ async function lexicalSearchRanksExpectedChunk(): Promise<void> {
 		);
 		await writeFile(join(dir, "src", "logging.ts"), "export const logger = console;\n", "utf8");
 		await writeFile(join(dir, "node_modules", "ignored", "auth.ts"), "authentication token ignored dependency\n", "utf8");
+		await writeFile(join(dir, ".venv", "lib", "auth.ts"), "authentication token ignored virtualenv\n", "utf8");
 
 		const result = await runSemanticSearch({
 			root: dir,
@@ -282,6 +284,7 @@ async function lexicalSearchRanksExpectedChunk(): Promise<void> {
 		assert.equal(result.results[0]?.path, "src/auth.ts");
 		assert.match(result.results[0]?.snippet ?? "", /authenticationMiddleware/);
 		assert.equal(result.results.some((entry) => entry.path.includes("node_modules")), false);
+		assert.equal(result.results.some((entry) => entry.path.includes(".venv")), false);
 	});
 }
 
@@ -502,6 +505,37 @@ async function toolRejectsWorkspaceEscapesAndReturnsResults(): Promise<void> {
 	});
 }
 
+async function semanticSearchToolAcceptsFilePath(): Promise<void> {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "app"), { recursive: true });
+		await writeFile(
+			join(dir, "app", "api.py"),
+			[
+				"def get_day():",
+				"    return raw_json_response()",
+				"",
+				"def get_availability():",
+				"    return {'available': True}",
+			].join("\n"),
+			"utf8",
+		);
+		await writeFile(join(dir, "app", "other.py"), "def unrelated():\n    pass\n", "utf8");
+
+		const tool = createSemanticSearchTool(dir);
+		const result = await tool.execute(
+			"search-file-path",
+			{ path: "app/api.py", query: "get_day availability", maxResults: 5 },
+			undefined,
+			undefined,
+			undefined,
+		);
+
+		assert.equal(result.details?.indexedFiles, 1);
+		assert.equal(result.details?.results.every((entry) => entry.path === "app/api.py"), true);
+		assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /app\/api.py/);
+	});
+}
+
 async function embedsTextsInInputOrder(): Promise<void> {
 	await withEmbeddingServer((body, response) => {
 		assert.equal(body.model, "local-embed");
@@ -558,6 +592,213 @@ async function denseSearchRanksSemanticHitAndFallsBackOnFailure(): Promise<void>
 			assert.equal(result.mode, "lexical");
 			assert.match(result.warnings[0] ?? "", /embedding path failed/);
 			assert.equal(result.results[0]?.path, "src/paint.ts");
+		});
+	});
+}
+
+async function coderankEmbeddingProfileAppliesQueryPrefixAndModelDefaults(): Promise<void> {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "src"), { recursive: true });
+		await writeFile(join(dir, "src", "auth.ts"), "export function login() { return readCredential(); }\n", "utf8");
+
+		const requests: Array<{ model: string; input: string[] }> = [];
+		await withEmbeddingServer((body, response) => {
+			requests.push(body);
+			response
+				.writeHead(200, { "content-type": "application/json" })
+				.end(JSON.stringify({ data: body.input.map((text, index) => ({ index, embedding: vectorForText(text) })) }));
+		}, async (baseUrl) => {
+			const coderank = await runSemanticSearch({
+				root: dir,
+				query: "user sign in secret retrieval",
+				extensions: ["ts"],
+				useEmbeddings: true,
+				embeddingProfile: "coderank",
+				embedBaseUrl: baseUrl,
+			});
+			assert.equal(coderank.mode, "hybrid");
+			assert.equal(requests[0]?.model, "nomic-ai/CodeRankEmbed");
+			assert.match(requests[0]?.input[0] ?? "", /^# File: src\/auth\.ts/);
+			assert.doesNotMatch(requests[0]?.input[0] ?? "", /^Represent this code/);
+			assert.equal(requests[1]?.model, "nomic-ai/CodeRankEmbed");
+			assert.deepEqual(requests[1]?.input, ["Represent this query for searching relevant code: user sign in secret retrieval"]);
+
+			await runSemanticSearch({
+				root: dir,
+				query: "user sign in secret retrieval",
+				extensions: ["ts"],
+				useEmbeddings: true,
+				embeddingProfile: "coderank",
+				embedBaseUrl: baseUrl,
+				embedModel: "override-embed",
+			});
+			assert.equal(requests[2]?.model, "override-embed");
+			assert.equal(requests[3]?.model, "override-embed");
+
+			await runSemanticSearch({
+				root: dir,
+				query: "user sign in secret retrieval",
+				extensions: ["ts"],
+				useEmbeddings: true,
+				embedBaseUrl: baseUrl,
+			});
+			assert.equal(requests[4]?.model, "nomic-embed-text-v1.5");
+			assert.equal(requests[5]?.model, "nomic-embed-text-v1.5");
+			assert.deepEqual(requests[5]?.input, ["user sign in secret retrieval"]);
+		});
+	});
+}
+
+async function denseSearchUsesAllIndexedChunkEmbeddings(): Promise<void> {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "src"), { recursive: true });
+		await writeFile(join(dir, "src", "auth.ts"), "export function login() { return readCredential(); }\n", "utf8");
+		await writeFile(join(dir, "src", "paint.ts"), "export function paint() { return drawCanvas(); }\n", "utf8");
+		await writeFile(join(dir, "src", "store.ts"), "export function upsertEvent() { return true; }\n", "utf8");
+
+		await withEmbeddingServer((body, response) => {
+			response
+				.writeHead(200, { "content-type": "application/json" })
+				.end(JSON.stringify({ data: body.input.map((text, index) => ({ index, embedding: vectorForText(text) })) }));
+		}, async (baseUrl) => {
+			const result = await runSemanticSearch({
+				root: dir,
+				query: "paint canvas",
+				extensions: ["ts"],
+				useEmbeddings: true,
+				embedBaseUrl: baseUrl,
+				embedModel: "local-embed",
+			});
+
+			assert.equal(result.mode, "hybrid");
+			assert.equal(result.embeddingStats.encodedDocumentCount, 3);
+			assert.equal(result.results[0]?.path, "src/paint.ts");
+		});
+	});
+}
+
+async function denseSearchRunsWhenLexicalHasNoCandidates(): Promise<void> {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "src"), { recursive: true });
+		await writeFile(join(dir, "src", "canvas.ts"), "export function drawCanvas() { return true; }\n", "utf8");
+
+		await withEmbeddingServer((body, response) => {
+			response
+				.writeHead(200, { "content-type": "application/json" })
+				.end(JSON.stringify({ data: body.input.map((text, index) => ({ index, embedding: vectorForText(text) })) }));
+		}, async (baseUrl) => {
+			const result = await runSemanticSearch({
+				root: dir,
+				query: "paint visual surface",
+				extensions: ["ts"],
+				useEmbeddings: true,
+				embedBaseUrl: baseUrl,
+				embedModel: "local-embed",
+			});
+
+			assert.equal(result.mode, "hybrid");
+			assert.equal(result.results[0]?.path, "src/canvas.ts");
+		});
+	});
+}
+
+async function warmDenseSearchEmbedsQueryOnlyAndReusesDocumentEmbeddings(): Promise<void> {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "src"), { recursive: true });
+		await writeFile(join(dir, "src", "auth.ts"), "export function login() { return readCredential(); }\n", "utf8");
+		await writeFile(join(dir, "src", "canvas.ts"), "export function drawCanvas() { return true; }\n", "utf8");
+
+		const requests: Array<{ model: string; input: string[] }> = [];
+		await withEmbeddingServer((body, response) => {
+			requests.push(body);
+			response
+				.writeHead(200, { "content-type": "application/json" })
+				.end(JSON.stringify({ data: body.input.map((text, index) => ({ index, embedding: vectorForText(text) })) }));
+		}, async (baseUrl) => {
+			const cold = await runSemanticSearch({
+				root: dir,
+				query: "paint visual surface",
+				extensions: ["ts"],
+				useCache: true,
+				reindex: true,
+				useEmbeddings: true,
+				embeddingProfile: "coderank",
+				embedBaseUrl: baseUrl,
+			});
+			assert.equal(cold.embeddingStats.encodeQueryCalls, 1);
+			assert.equal(cold.embeddingStats.encodeDocumentCalls, 1);
+			assert.equal(cold.embeddingStats.encodedDocumentCount, 2);
+
+			requests.splice(0, requests.length);
+			const warm = await runSemanticSearch({
+				root: dir,
+				query: "paint visual surface",
+				extensions: ["ts"],
+				useCache: true,
+				useEmbeddings: true,
+				embeddingProfile: "coderank",
+				embedBaseUrl: baseUrl,
+			});
+			assert.equal(warm.mode, "hybrid");
+			assert.equal(warm.results[0]?.path, "src/canvas.ts");
+			assert.equal(warm.embeddingStats.encodeQueryCalls, 1);
+			assert.equal(warm.embeddingStats.encodeDocumentCalls, 0);
+			assert.equal(warm.embeddingStats.encodedDocumentCount, 0);
+			assert.equal(requests.length, 1);
+			assert.equal(requests[0]?.input.length, 1);
+			assert.equal(requests[0]?.input[0], "Represent this query for searching relevant code: paint visual surface");
+		});
+	});
+}
+
+async function embeddingCachePreservesChunkVectorsAcrossScopedSearches(): Promise<void> {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "src"), { recursive: true });
+		await writeFile(join(dir, "src", "auth.ts"), "export function login() { return readCredential(); }\n", "utf8");
+		await writeFile(join(dir, "src", "canvas.js"), "export function drawCanvas() { return true; }\n", "utf8");
+
+		await withEmbeddingServer((body, response) => {
+			response
+				.writeHead(200, { "content-type": "application/json" })
+				.end(JSON.stringify({ data: body.input.map((text, index) => ({ index, embedding: vectorForText(text) })) }));
+		}, async (baseUrl) => {
+			const tsCold = await runSemanticSearch({
+				root: dir,
+				query: "user sign in secret retrieval",
+				extensions: ["ts"],
+				useCache: true,
+				reindex: true,
+				useEmbeddings: true,
+				embeddingProfile: "coderank",
+				embedBaseUrl: baseUrl,
+			});
+			assert.equal(tsCold.embeddingStats.encodeDocumentCalls, 1);
+			assert.equal(tsCold.embeddingStats.encodedDocumentCount, 1);
+
+			const jsCold = await runSemanticSearch({
+				root: dir,
+				query: "paint visual surface",
+				extensions: ["js"],
+				useCache: true,
+				useEmbeddings: true,
+				embeddingProfile: "coderank",
+				embedBaseUrl: baseUrl,
+			});
+			assert.equal(jsCold.embeddingStats.encodeDocumentCalls, 1);
+			assert.equal(jsCold.embeddingStats.encodedDocumentCount, 1);
+
+			const tsWarm = await runSemanticSearch({
+				root: dir,
+				query: "user sign in secret retrieval",
+				extensions: ["ts"],
+				useCache: true,
+				useEmbeddings: true,
+				embeddingProfile: "coderank",
+				embedBaseUrl: baseUrl,
+			});
+			assert.equal(tsWarm.embeddingStats.encodeQueryCalls, 1);
+			assert.equal(tsWarm.embeddingStats.encodeDocumentCalls, 0);
+			assert.equal(tsWarm.embeddingStats.encodedDocumentCount, 0);
 		});
 	});
 }
@@ -724,8 +965,14 @@ await persistentCacheReusesAndRefreshesIndex();
 await searchReceiptReportsFreshnessAndRevision();
 await searchReceiptAccountsForSkippedCandidates();
 await toolRejectsWorkspaceEscapesAndReturnsResults();
+await semanticSearchToolAcceptsFilePath();
 await embedsTextsInInputOrder();
 await denseSearchRanksSemanticHitAndFallsBackOnFailure();
+await coderankEmbeddingProfileAppliesQueryPrefixAndModelDefaults();
+await denseSearchUsesAllIndexedChunkEmbeddings();
+await denseSearchRunsWhenLexicalHasNoCandidates();
+await warmDenseSearchEmbedsQueryOnlyAndReusesDocumentEmbeddings();
+await embeddingCachePreservesChunkVectorsAcrossScopedSearches();
 await hydeExpansionDrivesDenseQueryAndFallsBackOnFailure();
 await rerankerReordersCandidatesAndFallsBackOnFailure();
 await qdrantAdapterRanksAndFallsBack();

@@ -83,6 +83,46 @@ async function rejectsWorkspaceEscape(): Promise<void> {
 	});
 }
 
+async function appliesValidNewFilePatch(): Promise<void> {
+	await withTempDir(async (dir) => {
+		const patch = [
+			"--- /dev/null",
+			"+++ b/tests/example.py",
+			"@@ -0,0 +1,4 @@",
+			"+import unittest",
+			"+",
+			"+class ExampleTests(unittest.TestCase):",
+			"+    pass",
+			"",
+		].join("\n");
+
+		const result = await applyUnifiedDiff({ cwd: dir, patch });
+
+		assert.equal(await readFile(join(dir, "tests/example.py"), "utf8"), "import unittest\n\nclass ExampleTests(unittest.TestCase):\n    pass\n");
+		assert.equal(result.appliedFiles[0]?.path, "tests/example.py");
+	});
+}
+
+async function malformedNewFilePatchReportsHunkCount(): Promise<void> {
+	await withTempDir(async (dir) => {
+		const patch = [
+			"--- /dev/null",
+			"+++ b/tests/example.py",
+			"@@ -0,0 +1,5 @@",
+			"+import unittest",
+			"+",
+			"+class ExampleTests(unittest.TestCase):",
+			"+    pass",
+			"",
+		].join("\n");
+
+		await assert.rejects(
+			() => applyUnifiedDiff({ cwd: dir, patch }),
+			/new file hunk for tests\/example\.py declares 5 added lines but contains 4 added lines/,
+		);
+	});
+}
+
 async function toolUsesExecutorNameAndPlannerBlocksIt(): Promise<void> {
 	const tool = createApplyDiffTool(process.cwd());
 	assert.equal(tool.name, "apply_diff");
@@ -94,5 +134,7 @@ async function toolUsesExecutorNameAndPlannerBlocksIt(): Promise<void> {
 await appliesPatchAfterDryRun();
 await dryRunFailureDoesNotWriteAnyFile();
 await rejectsWorkspaceEscape();
+await appliesValidNewFilePatch();
+await malformedNewFilePatchReportsHunkCount();
 await toolUsesExecutorNameAndPlannerBlocksIt();
 console.log("apply-diff-unit: ok");

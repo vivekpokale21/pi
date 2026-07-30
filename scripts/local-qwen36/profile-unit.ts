@@ -75,6 +75,7 @@ const model = createLocalQwen36Model("Qwen3.6-35B-A3B-IQ4_XS-4.15bpw.gguf", "htt
 assert.equal(model.provider, "local-llama-cpp");
 assert.equal(model.api, "openai-completions");
 assert.equal(model.reasoning, true);
+assert.equal(model.maxTokens, 0);
 assert.equal(model.compat?.thinkingFormat, "qwen-chat-template");
 assert.equal(model.compat?.supportsDeveloperRole, false);
 
