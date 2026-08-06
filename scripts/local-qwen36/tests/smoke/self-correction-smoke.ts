@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { runBuildSelfCorrection } from "./self-correction.ts";
+import { runBuildSelfCorrection } from "../../self-correction.ts";
 
 const execFileAsync = promisify(execFile);
 const baseUrl = process.env.QWEN36_BASE_URL ?? "http://127.0.0.1:8080/v1";

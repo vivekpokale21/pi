@@ -15,6 +15,7 @@ QWEN36_N_CPU_MOE="${QWEN36_N_CPU_MOE:-34}"
 QWEN36_CACHE_TYPE_K="${QWEN36_CACHE_TYPE_K:-q8_0}"
 QWEN36_CACHE_TYPE_V="${QWEN36_CACHE_TYPE_V:-q8_0}"
 QWEN36_FIT="${QWEN36_FIT:-on}"
+QWEN36_CHAT_TEMPLATE_FILE="${QWEN36_CHAT_TEMPLATE_FILE:-}"
 QWEN36_DRY_RUN=0
 
 usage() {
@@ -28,6 +29,8 @@ Environment overrides:
   QWEN36_MODEL_PATH     Path to Qwen3.6-35B-A3B-IQ4_XS GGUF
   QWEN36_HOST           Bind host, default 127.0.0.1
   QWEN36_PORT           Bind port, default 8080
+  QWEN36_CHAT_TEMPLATE_FILE
+                         Optional Jinja chat template file passed to llama.cpp
 USAGE
 }
 
@@ -69,6 +72,9 @@ require_executable() {
 
 require_executable "$LLAMA_CPP_SERVER_BIN" "llama-server"
 require_file "$QWEN36_MODEL_PATH" "Qwen3.6 model"
+if [[ -n "$QWEN36_CHAT_TEMPLATE_FILE" ]]; then
+	require_file "$QWEN36_CHAT_TEMPLATE_FILE" "chat template"
+fi
 
 cmd=(
 	"$LLAMA_CPP_SERVER_BIN"
@@ -87,6 +93,10 @@ cmd=(
 	--jinja
 	--no-mmproj
 )
+
+if [[ -n "$QWEN36_CHAT_TEMPLATE_FILE" ]]; then
+	cmd+=(--chat-template-file "$QWEN36_CHAT_TEMPLATE_FILE")
+fi
 
 if [[ "$QWEN36_DRY_RUN" == "1" ]]; then
 	printf '%q ' "${cmd[@]}"

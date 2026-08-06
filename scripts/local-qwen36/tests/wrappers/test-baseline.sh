@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "$ROOT_DIR"
 
 dry_run="$(scripts/local-qwen36/start-llama-server.sh --dry-run)"
@@ -23,6 +23,13 @@ require_contains "-b 2048"
 require_contains "-ub 2048"
 require_contains "--jinja"
 
+template_dry_run="$(QWEN36_CHAT_TEMPLATE_FILE=scripts/local-qwen36/tests/wrappers/test-baseline.sh scripts/local-qwen36/start-llama-server.sh --dry-run)"
+if [[ "$template_dry_run" != *"--chat-template-file scripts/local-qwen36/tests/wrappers/test-baseline.sh"* ]]; then
+	echo "template dry-run command missing expected chat template flag" >&2
+	echo "$template_dry_run" >&2
+	exit 1
+fi
+
 base_url="${QWEN36_BASE_URL:-http://127.0.0.1:8080/v1}"
 if ! curl -fsS --max-time 2 "$base_url/models" >/tmp/pi-qwen36-models.json; then
 	if [[ "${REQUIRE_LIVE_QWEN36:-0}" == "1" ]]; then
@@ -33,4 +40,4 @@ if ! curl -fsS --max-time 2 "$base_url/models" >/tmp/pi-qwen36-models.json; then
 	exit 0
 fi
 
-npx tsx scripts/local-qwen36/tool-smoke.ts
+npx tsx scripts/local-qwen36/tests/smoke/tool-smoke.ts

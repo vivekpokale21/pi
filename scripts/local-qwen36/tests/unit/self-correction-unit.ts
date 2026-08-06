@@ -1,6 +1,6 @@
 #!/usr/bin/env -S node --import tsx
 import assert from "node:assert/strict";
-import { runBuildSelfCorrection } from "./self-correction.ts";
+import { runBuildSelfCorrection } from "../../self-correction.ts";
 
 async function successReturnsWithoutExecutor(): Promise<void> {
 	let executorCalls = 0;

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S node --import tsx
 import assert from "node:assert/strict";
-import { getQwen36Profile } from "./profiles.ts";
-import { buildQwen36ProfileMemoryBlock, buildQwen36SystemPromptWithMemory } from "./profile-memory.ts";
+import { getQwen36Profile } from "../../profiles.ts";
+import { buildQwen36ProfileMemoryBlock, buildQwen36SystemPromptWithMemory } from "../../profile-memory.ts";
 
 const memoryBlock = buildQwen36ProfileMemoryBlock("continue qwen memory compaction");
 assert.match(memoryBlock, /<qwen36_memory>/);

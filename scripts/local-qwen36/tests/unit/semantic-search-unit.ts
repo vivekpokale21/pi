@@ -14,9 +14,9 @@ import {
 	rerankSearchResults,
 	runSemanticSearch,
 	upsertQdrantVectors,
-} from "./semantic-search.ts";
-import { createTypeScriptParserAdapter } from "./parser-adapters.ts";
-import { EXECUTOR_TOOL_NAMES, isPlannerToolAllowed, PLANNER_TOOL_NAMES } from "./read-only.ts";
+} from "../../semantic-search.ts";
+import { createTypeScriptParserAdapter } from "../../parser-adapters.ts";
+import { EXECUTOR_TOOL_NAMES, isPlannerToolAllowed, PLANNER_TOOL_NAMES } from "../../read-only.ts";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
 	const dir = await mkdtemp(join(tmpdir(), "pi-semantic-search-"));

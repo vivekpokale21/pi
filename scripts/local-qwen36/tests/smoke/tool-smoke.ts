@@ -1,8 +1,8 @@
 #!/usr/bin/env -S node --import tsx
-import { Agent, type AgentEvent, type AgentTool } from "../../packages/agent/src/index.ts";
-import { streamSimple } from "../../packages/ai/src/api/openai-completions.ts";
-import { Type, type AssistantMessage, type Static } from "../../packages/ai/src/index.ts";
-import { createLocalQwen36Model, resolveLocalQwen36ModelId } from "./profiles.ts";
+import { Agent, type AgentEvent, type AgentTool } from "../../../../packages/agent/src/index.ts";
+import { streamSimple } from "../../../../packages/ai/src/api/openai-completions.ts";
+import { Type, type AssistantMessage, type Static } from "../../../../packages/ai/src/index.ts";
+import { createLocalQwen36Model, resolveLocalQwen36ModelId } from "../../profiles.ts";
 
 const baseUrl = process.env.QWEN36_BASE_URL ?? "http://127.0.0.1:8080/v1";
 const marker = process.env.QWEN36_TOOL_SMOKE_MARKER ?? "PI_QWEN36_TOOL_SMOKE";

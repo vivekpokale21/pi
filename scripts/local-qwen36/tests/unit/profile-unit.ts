@@ -1,7 +1,7 @@
 #!/usr/bin/env -S node --import tsx
 import assert from "node:assert/strict";
-import { applyQwen36ProfileToPayload, createLocalQwen36Model, getQwen36Profile } from "./profiles.ts";
-import { EXECUTOR_TOOL_NAMES, isPlannerToolAllowed, isReadOnlyBash, PLANNER_TOOL_NAMES } from "./read-only.ts";
+import { applyQwen36ProfileToPayload, createLocalQwen36Model, getQwen36Profile } from "../../profiles.ts";
+import { EXECUTOR_TOOL_NAMES, isPlannerToolAllowed, isReadOnlyBash, PLANNER_TOOL_NAMES } from "../../read-only.ts";
 
 const planner = getQwen36Profile("planner");
 assert.equal(planner.temperature, 0.55);

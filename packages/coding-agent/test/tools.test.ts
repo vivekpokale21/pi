@@ -161,6 +161,67 @@ describe("Coding Agent Tools", () => {
 			expect(output).toContain("[40 more lines in file. Use offset=61 to continue.]");
 		});
 
+		it("should return a structural outline without dumping the full file", async () => {
+			const testFile = join(testDir, "outline.ts");
+			writeFileSync(
+				testFile,
+				[
+					'import fs from "node:fs";',
+					"",
+					"export class Runner {",
+					"\tstart(): void {}",
+					"}",
+					"",
+					"export function calculate(value: number): number {",
+					"\treturn value * 2;",
+					"}",
+					"",
+					"const internal = () => calculate(2);",
+					"",
+				].join("\n"),
+			);
+
+			const result = await readTool.execute("test-call-outline", { path: testFile, mode: "outline" } as any);
+			const output = getTextOutput(result);
+
+			expect(output).toContain("<file_outline");
+			expect(output).toContain('lines="12"');
+			expect(output).toContain("line 3 class Runner");
+			expect(output).toContain("line 7 function calculate");
+			expect(output).not.toContain("return value * 2");
+		});
+
+		it("should read an enclosing symbol body by name", async () => {
+			const testFile = join(testDir, "symbol.ts");
+			writeFileSync(
+				testFile,
+				[
+					"export function first(): string {",
+					'\treturn "first";',
+					"}",
+					"",
+					"export function target(value: number): number {",
+					"\tconst doubled = value * 2;",
+					"\treturn doubled;",
+					"}",
+					"",
+					"export function last(): string {",
+					'\treturn "last";',
+					"}",
+					"",
+				].join("\n"),
+			);
+
+			const result = await readTool.execute("test-call-symbol", { path: testFile, symbol: "target" } as any);
+			const output = getTextOutput(result);
+
+			expect(output).toContain("export function target");
+			expect(output).toContain("return doubled");
+			expect(output).not.toContain('return "first"');
+			expect(output).not.toContain('return "last"');
+			expect(output).toContain("[Showing symbol target lines 5-8 of 13.]");
+		});
+
 		it("should show error when offset is beyond file length", async () => {
 			const testFile = join(testDir, "short.txt");
 			writeFileSync(testFile, "Line 1\nLine 2\nLine 3");

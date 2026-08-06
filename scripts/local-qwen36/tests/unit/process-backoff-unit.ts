@@ -8,7 +8,7 @@ import {
 	createProcessHealthStore,
 	runWithCrashBackoff,
 	type ProcessRunResult,
-} from "./process-backoff.ts";
+} from "../../process-backoff.ts";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
 	const dir = await mkdtemp(join(tmpdir(), "pi-process-backoff-"));

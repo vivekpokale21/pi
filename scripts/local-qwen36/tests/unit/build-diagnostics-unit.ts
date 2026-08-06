@@ -1,6 +1,6 @@
 #!/usr/bin/env -S node --import tsx
 import assert from "node:assert/strict";
-import { formatBuildDiagnosticsForPrompt, parseBuildDiagnostics } from "./build-diagnostics.ts";
+import { formatBuildDiagnosticsForPrompt, parseBuildDiagnostics } from "../../build-diagnostics.ts";
 
 function parsesTypeScriptDiagnostics(): void {
 	const diagnostics = parseBuildDiagnostics(

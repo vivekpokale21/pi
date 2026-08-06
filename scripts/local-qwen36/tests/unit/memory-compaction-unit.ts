@@ -8,7 +8,7 @@ import {
 	classifyMemoryLine,
 	compactHierarchicalMemory,
 	loadRecentPersistentSummary,
-} from "./memory-compaction.ts";
+} from "../../memory-compaction.ts";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
 	const dir = await mkdtemp(join(tmpdir(), "pi-memory-compaction-"));
