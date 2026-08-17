@@ -32,6 +32,8 @@ import {
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { getAgentDir } from "../config.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
+import { createLocalModelProvider, type LocalModelProviderRuntime } from "./local-model-catalog.ts";
+import { LocalModelRuntimeManager, type LocalModelRuntimeState } from "./local-model-runtime-manager.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
 import {
@@ -67,6 +69,7 @@ export interface CreateModelRuntimeOptions {
 	/** Timeout for the create-time network model refresh. */
 	modelRefreshTimeoutMs?: number;
 	catalogBaseUrl?: string;
+	localModelRuntimeManager?: LocalModelProviderRuntime;
 }
 
 export interface ModelRuntimeAuthOverrides {
@@ -111,6 +114,8 @@ export class ModelRuntime implements Models {
 	};
 	private availabilityRefresh: Promise<void> | undefined;
 	private availabilityError: string | undefined;
+	private localModelRuntimeManager: LocalModelProviderRuntime | undefined;
+	private disposed = false;
 
 	private constructor(
 		credentials: RuntimeCredentials,
@@ -148,14 +153,17 @@ export class ModelRuntime implements Models {
 					? provider
 					: withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt),
 			);
+		const localModelRuntimeManager = options.localModelRuntimeManager ?? new LocalModelRuntimeManager();
+		const localModelProvider = await createLocalModelProvider({ runtimeManager: localModelRuntimeManager });
 		const runtime = new ModelRuntime(
 			credentials,
 			config,
 			modelsPath,
 			modelsStore,
-			providers,
+			[...providers, localModelProvider],
 			process.env.PI_OFFLINE === undefined,
 		);
+		runtime.localModelRuntimeManager = localModelRuntimeManager;
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
 		const refreshFromNetwork = runtime.modelNetworkEnabled && options.allowModelNetwork === true;
@@ -352,6 +360,10 @@ export class ModelRuntime implements Models {
 
 	getRegisteredNativeProvider(providerId: string): Provider | undefined {
 		return this.nativeExtensionProviders.get(providerId);
+	}
+
+	subscribeLocalModelRuntime(listener: (state: LocalModelRuntimeState) => void): () => void {
+		return this.localModelRuntimeManager?.subscribe?.(listener) ?? (() => {});
 	}
 
 	/** @internal Compatibility fallback for ModelRegistry when provider auth is unconfigured. */
@@ -593,5 +605,11 @@ export class ModelRuntime implements Models {
 		this.recomposeProvider(providerId);
 		this.updateModelSnapshot();
 		void this.refresh({ allowNetwork: false });
+	}
+
+	async dispose(): Promise<void> {
+		if (this.disposed) return;
+		this.disposed = true;
+		await this.localModelRuntimeManager?.shutdown?.();
 	}
 }

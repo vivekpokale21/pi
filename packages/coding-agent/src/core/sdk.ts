@@ -29,6 +29,7 @@ import {
 	type ToolName,
 	withFileMutationQueue,
 } from "./tools/index.ts";
+import { WorkspaceSemanticIndex, type WorkspaceSemanticIndexOptions } from "./workspace-semantic-index.ts";
 
 // Preserve the pre-0.81 fallback for extensions that construct Agent instances
 // or invoke low-level agent loops without supplying streamFn. Agent core remains
@@ -71,6 +72,10 @@ export interface CreateAgentSessionOptions {
 	excludeTools?: string[];
 	/** Custom tools to register (in addition to built-in tools). */
 	customTools?: ToolDefinition[];
+	/** Shared cwd-bound semantic index, normally supplied by AgentSessionServices. */
+	semanticIndex?: WorkspaceSemanticIndex;
+	/** Options for an SDK-owned semantic index when semanticIndex is not supplied. */
+	semanticIndexOptions?: WorkspaceSemanticIndexOptions;
 
 	/** Resource loader. When omitted, DefaultResourceLoader is used. */
 	resourceLoader?: ResourceLoader;
@@ -169,6 +174,10 @@ function getDefaultAgentDir(): string {
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
+	const ownsSemanticIndex = !options.semanticIndex;
+	const semanticIndex =
+		options.semanticIndex ?? new WorkspaceSemanticIndex(cwd, { ...options.semanticIndexOptions, watch: true });
+	if (ownsSemanticIndex) semanticIndex.start();
 	let resourceLoader = options.resourceLoader;
 
 	const authPath = options.agentDir ? join(agentDir, "auth.json") : undefined;
@@ -242,7 +251,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
 	}
 
-	const defaultActiveToolNames: ToolName[] = ["read", "bash", "edit", "write"];
+	const defaultActiveToolNames: ToolName[] = ["read", "bash", "edit", "write", "semantic_search"];
 	const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
 	const excludedToolNames = options.excludeTools;
 	const excludedToolNameSet = excludedToolNames ? new Set(excludedToolNames) : undefined;
@@ -381,6 +390,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		scopedModels: options.scopedModels,
 		resourceLoader,
 		customTools: options.customTools,
+		semanticIndex,
+		ownsSemanticIndex,
 		modelRuntime,
 		initialActiveToolNames,
 		allowedToolNames,

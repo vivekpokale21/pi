@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { constants } from "fs";
@@ -7,7 +8,11 @@ import { renderDiff } from "../../modes/interactive/components/diff.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import {
+	type AppliedPatchHunk,
 	applyEditsToNormalizedContent,
+	applyUnifiedPatchToNormalizedContent,
+	type ChangedRange,
+	computeChangedRanges,
 	computeEditsDiff,
 	detectLineEnding,
 	type Edit,
@@ -44,10 +49,21 @@ const replaceEditSchema = Type.Object(
 const editSchema = Type.Object(
 	{
 		path: Type.String({ description: "Path to the file to edit (relative or absolute)" }),
-		edits: Type.Array(replaceEditSchema, {
-			description:
-				"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
-		}),
+		edits: Type.Optional(
+			Type.Array(replaceEditSchema, {
+				description:
+					"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
+			}),
+		),
+		patch: Type.Optional(
+			Type.String({
+				description:
+					"Single-file unified diff to apply. Hunk line counts and starting lines are treated as hints; old-side body context must match uniquely.",
+			}),
+		),
+		expectedRevision: Type.Optional(
+			Type.String({ description: "SHA-256 file revision from a prior exact read receipt." }),
+		),
 	},
 	{},
 );
@@ -65,6 +81,17 @@ export interface EditToolDetails {
 	patch: string;
 	/** Line number of the first change in the new file (for editor navigation) */
 	firstChangedLine?: number;
+	/** Edit-authoritative provenance and resulting file revision */
+	receipt: {
+		path: string;
+		oldRevision: string;
+		newRevision: string;
+		editsApplied: number;
+		oldBytes: number;
+		newBytes: number;
+		changedRanges: ChangedRange[];
+		hunks?: AppliedPatchHunk[];
+	};
 }
 
 /**
@@ -117,11 +144,25 @@ function prepareEditArguments(input: unknown): EditToolInput {
 	return { ...rest, edits } as EditToolInput;
 }
 
-function validateEditInput(input: EditToolInput): { path: string; edits: Edit[] } {
-	if (!Array.isArray(input.edits) || input.edits.length === 0) {
+function validateEditInput(input: EditToolInput): {
+	path: string;
+	edits?: Edit[];
+	patch?: string;
+	expectedRevision?: string;
+} {
+	const hasEdits = Array.isArray(input.edits) && input.edits.length > 0;
+	const hasPatch = typeof input.patch === "string" && input.patch.length > 0;
+	if (Array.isArray(input.edits) && input.edits.length === 0 && !hasPatch) {
 		throw new Error("Edit tool input is invalid. edits must contain at least one replacement.");
 	}
-	return { path: input.path, edits: input.edits };
+	if (hasEdits === hasPatch) {
+		throw new Error("Edit tool input is invalid. Provide exactly one of edits or patch.");
+	}
+	return { path: input.path, edits: input.edits, patch: input.patch, expectedRevision: input.expectedRevision };
+}
+
+function sha256(content: string): string {
+	return createHash("sha256").update(content, "utf8").digest("hex");
 }
 
 type RenderableEditArgs = {
@@ -306,7 +347,7 @@ export function createEditToolDefinition(
 		renderShell: "self",
 		prepareArguments: prepareEditArguments,
 		async execute(_toolCallId, input: EditToolInput, signal?: AbortSignal, _onUpdate?, _ctx?) {
-			const { path, edits } = validateEditInput(input);
+			const { path, edits, patch: patchInput, expectedRevision } = validateEditInput(input);
 			const absolutePath = resolveToCwd(path, cwd);
 
 			return withFileMutationQueue(absolutePath, async () => {
@@ -334,29 +375,69 @@ export function createEditToolDefinition(
 				// Read the file.
 				const buffer = await ops.readFile(absolutePath);
 				const rawContent = buffer.toString("utf-8");
+				const oldRevision = sha256(rawContent);
+				if (expectedRevision !== undefined && expectedRevision !== oldRevision) {
+					throw new Error(
+						`Stale file revision for ${path}. Expected ${expectedRevision}, but current revision is ${oldRevision}. Re-read the file before editing.`,
+					);
+				}
 				throwIfAborted();
 
 				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
 				const { bom, text: content } = stripBom(rawContent);
 				const originalEnding = detectLineEnding(content);
 				const normalizedContent = normalizeToLF(content);
-				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+				let baseContent: string;
+				let newContent: string;
+				let editsApplied: number;
+				let hunks: AppliedPatchHunk[] | undefined;
+				if (patchInput !== undefined) {
+					const applied = applyUnifiedPatchToNormalizedContent(normalizedContent, patchInput, path);
+					baseContent = applied.baseContent;
+					newContent = applied.newContent;
+					editsApplied = applied.hunksApplied;
+					hunks = applied.hunks;
+				} else {
+					const applied = applyEditsToNormalizedContent(normalizedContent, edits ?? [], path);
+					baseContent = applied.baseContent;
+					newContent = applied.newContent;
+					editsApplied = edits?.length ?? 0;
+				}
 				throwIfAborted();
 
 				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
 				await ops.writeFile(absolutePath, finalContent);
 				throwIfAborted();
 
+				const newRevision = sha256(finalContent);
 				const diffResult = generateDiffString(baseContent, newContent);
 				const patch = generateUnifiedPatch(path, baseContent, newContent);
+				const receipt: EditToolDetails["receipt"] = {
+					path: absolutePath,
+					oldRevision,
+					newRevision,
+					editsApplied,
+					oldBytes: Buffer.byteLength(rawContent, "utf-8"),
+					newBytes: Buffer.byteLength(finalContent, "utf-8"),
+					changedRanges: computeChangedRanges(baseContent, newContent),
+				};
+				if (hunks) receipt.hunks = hunks;
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
+							text:
+								patchInput !== undefined
+									? `Successfully applied patch to ${path}.`
+									: `Successfully replaced ${edits?.length ?? 0} block(s) in ${path}.`,
 						},
 					],
-					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
+					details: {
+						diff: diffResult.diff,
+						patch,
+						firstChangedLine: diffResult.firstChangedLine,
+						receipt,
+					},
 				};
 			});
 		},

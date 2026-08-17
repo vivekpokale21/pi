@@ -3,12 +3,15 @@ import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it } from "vitest";
+import type { AgentSession } from "../../src/core/agent-session.ts";
 import {
+	AgentSessionRuntime,
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.ts";
+import type { AgentSessionServices } from "../../src/core/agent-session-services.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import type {
@@ -33,6 +36,35 @@ describe("AgentSessionRuntime characterization", () => {
 		while (cleanups.length > 0) {
 			await cleanups.pop()?.();
 		}
+	});
+
+	it("disposes owned services after session shutdown on quit", async () => {
+		let sessionDisposed = false;
+		let servicesDisposed = false;
+		const fakeSession = {
+			extensionRunner: {
+				hasHandlers: () => false,
+			},
+			dispose: () => {
+				sessionDisposed = true;
+			},
+		} as unknown as AgentSession;
+		const fakeServices = {
+			cwd: "/tmp/pi-runtime-dispose",
+			agentDir: "/tmp/pi-runtime-dispose",
+			diagnostics: [],
+			dispose: async () => {
+				servicesDisposed = true;
+			},
+		} as unknown as AgentSessionServices;
+		const runtime = new AgentSessionRuntime(fakeSession, fakeServices, async () => {
+			throw new Error("unused");
+		});
+
+		await runtime.dispose();
+
+		expect(sessionDisposed).toBe(true);
+		expect(servicesDisposed).toBe(true);
 	});
 
 	async function createRuntimeForTest(

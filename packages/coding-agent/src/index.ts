@@ -23,6 +23,7 @@ export {
 	parseSkillBlock,
 	type SessionStats,
 } from "./core/agent-session.ts";
+export { createSemanticIndexOptionsFromEnv } from "./core/agent-session-services.ts";
 export { readStoredCredential } from "./core/auth-storage.ts";
 // Compaction
 export {
@@ -180,6 +181,41 @@ export {
 	ModelRuntime,
 	type ModelRuntimeAuthOverrides,
 } from "./core/model-runtime.ts";
+export {
+	createNativeBenchmarkCliPlan,
+	declareNativeBenchmarkCapabilities,
+	getNativeDubaiBoomBenchmarkTasks,
+	type NativeBenchmarkCapabilityDeclaration,
+	type NativeBenchmarkCapabilityOptions,
+	type NativeBenchmarkCliOptions,
+	type NativeBenchmarkCliPlan,
+	type NativeBenchmarkCorpusArtifacts,
+	type NativeBenchmarkCorpusOptions,
+	type NativeBenchmarkCorpusResult,
+	type NativeBenchmarkEventTrace,
+	type NativeBenchmarkJsonlTraceEntry,
+	type NativeBenchmarkShellCommandValidationOptions,
+	type NativeBenchmarkShellCommandValidationResult,
+	type NativeBenchmarkTask,
+	type NativeBenchmarkTaskCorpus,
+	type NativeBenchmarkTaskOptions,
+	type NativeBenchmarkTaskResult,
+	type NativeBenchmarkValidationOptions,
+	type NativeBenchmarkValidationResult,
+	type NativeBenchmarkWebAccessStatus,
+	type NativeBenchmarkWorkspace,
+	type NativeBenchmarkWorkspaceOptions,
+	nativeBenchmarkCorpusSummaryMarkdown,
+	nativeBenchmarkJsonlTraceEntries,
+	nativeBenchmarkMarkdownReport,
+	runNativeBenchmarkCli,
+	runNativeBenchmarkCorpus,
+	runNativeBenchmarkTask,
+	validateNativeBenchmarkShellCommand,
+	writeNativeBenchmarkCorpusArtifacts,
+	writeNativeBenchmarkJsonlTrace,
+	writeNativeBenchmarkMarkdownReport,
+} from "./core/native-benchmark.ts";
 export type {
 	PackageManager,
 	PathMetadata,
@@ -281,6 +317,8 @@ export {
 	createLocalBashOperations,
 	createLsToolDefinition,
 	createReadToolDefinition,
+	createSemanticSearchTool,
+	createSemanticSearchToolDefinition,
 	createWriteToolDefinition,
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -323,6 +361,33 @@ export {
 	type ProjectTrustStoreEntry,
 	type ProjectTrustUpdate,
 } from "./core/trust-manager.ts";
+export {
+	createOpenAICompatibleWorkspaceEmbeddingProvider,
+	type OpenAICompatibleWorkspaceEmbeddingProviderOptions,
+} from "./core/workspace-embedding-provider.ts";
+export {
+	type WorkspaceEmbeddingRuntimeEndpoint,
+	WorkspaceEmbeddingRuntimeError,
+	WorkspaceEmbeddingRuntimeManager,
+	type WorkspaceEmbeddingRuntimeManagerOptions,
+	type WorkspaceEmbeddingRuntimeOperations,
+	type WorkspaceEmbeddingRuntimeProcess,
+	type WorkspaceEmbeddingRuntimeStartOptions,
+	type WorkspaceEmbeddingRuntimeState,
+	type WorkspaceEmbeddingRuntimeStateValue,
+} from "./core/workspace-embedding-runtime-manager.ts";
+export {
+	type WorkspaceSemanticEmbeddingProvider,
+	WorkspaceSemanticIndex,
+	type WorkspaceSemanticIndexOptions,
+	type WorkspaceSemanticIndexResult,
+	type WorkspaceSemanticIndexStatus,
+	type WorkspaceSemanticRelatedContext,
+	type WorkspaceSemanticRerankCandidate,
+	type WorkspaceSemanticRerankProvider,
+	type WorkspaceSemanticSearchResponse,
+	type WorkspaceSemanticVectorStatus,
+} from "./core/workspace-semantic-index.ts";
 // Main entry point
 export { type MainOptions, main } from "./main.ts";
 // Run modes for programmatic SDK usage

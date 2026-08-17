@@ -92,6 +92,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import type { LocalModelRuntimeState } from "./local-model-runtime-manager.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
@@ -107,6 +108,7 @@ import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts"
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
+import type { WorkspaceSemanticIndex } from "./workspace-semantic-index.ts";
 
 // ============================================================================
 // Skill Block Parsing
@@ -144,6 +146,7 @@ export type AgentSessionEvent =
 			willRetry: boolean;
 	  }
 	| { type: "agent_settled" }
+	| { type: "local_model_runtime_state"; state: LocalModelRuntimeState }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
@@ -206,8 +209,10 @@ export interface AgentSessionConfig {
 	customTools?: ToolDefinition[];
 	/** Canonical model/auth runtime used by coding-agent internals. */
 	modelRuntime: ModelRuntime;
-	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
+	/** Initial active built-in tool names. Default: [read, bash, edit, write, semantic_search] */
 	initialActiveToolNames?: string[];
+	semanticIndex?: WorkspaceSemanticIndex;
+	ownsSemanticIndex?: boolean;
 	/** Optional allowlist of tool names. When provided, only these tool names are exposed. */
 	allowedToolNames?: string[];
 	/** Optional denylist of tool names. When provided, these tool names are not exposed. */
@@ -358,8 +363,11 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
+	private _unsubscribeLocalModelRuntime?: () => void;
 
 	private _modelRuntime: ModelRuntime;
+	private _semanticIndex?: WorkspaceSemanticIndex;
+	private _ownsSemanticIndex: boolean;
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -381,6 +389,8 @@ export class AgentSession {
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
 		this._modelRuntime = config.modelRuntime;
+		this._semanticIndex = config.semanticIndex;
+		this._ownsSemanticIndex = config.ownsSemanticIndex ?? false;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
@@ -391,6 +401,9 @@ export class AgentSession {
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
+		this._unsubscribeLocalModelRuntime = this._modelRuntime.subscribeLocalModelRuntime((state) => {
+			this._emit({ type: "local_model_runtime_state", state });
+		});
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
 
@@ -849,6 +862,9 @@ export class AgentSession {
 			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 		);
 		this._disconnectFromAgent();
+		this._unsubscribeLocalModelRuntime?.();
+		this._unsubscribeLocalModelRuntime = undefined;
+		if (this._ownsSemanticIndex) this._semanticIndex?.cancel();
 		this._eventListeners = [];
 		cleanupSessionResources(this.sessionId);
 	}
@@ -2566,6 +2582,7 @@ export class AgentSession {
 			: createAllToolDefinitions(this._cwd, {
 					read: { autoResizeImages },
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
+					semanticSearch: { index: this._semanticIndex },
 				});
 
 		this._baseToolDefinitions = new Map(
@@ -2594,7 +2611,7 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write"];
+			: ["read", "bash", "edit", "write", "semantic_search"];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,

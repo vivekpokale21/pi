@@ -216,6 +216,35 @@ function isUnknownModel(model: Model<any> | undefined): boolean {
 	return !!model && model.provider === "unknown" && model.id === "unknown" && model.api === "unknown";
 }
 
+function formatLocalModelRuntimeStatus(
+	state: Extract<AgentSessionEvent, { type: "local_model_runtime_state" }>["state"],
+): string {
+	const modelLabel = state.modelId ?? (state.modelPath ? path.basename(state.modelPath) : "local model");
+	const message = state.message ? `: ${state.message}` : "";
+	switch (state.value) {
+		case "unloaded":
+			return "Local model runtime unloaded";
+		case "starting_server":
+			return `Starting local model runtime for ${modelLabel}...`;
+		case "loading_model":
+			return `Loading local model ${modelLabel}...`;
+		case "ready":
+			return state.baseUrl
+				? `Local model ${modelLabel} ready at ${state.baseUrl}`
+				: `Local model ${modelLabel} ready`;
+		case "runtime_unavailable":
+			return `Local model ${modelLabel} runtime unavailable${message}`;
+		case "model_missing":
+			return `Local model ${modelLabel} missing${message}`;
+		case "configuration_invalid":
+			return `Local model ${modelLabel} configuration invalid${message}`;
+		case "load_failed":
+			return `Local model ${modelLabel} load failed${message}`;
+		case "process_exited":
+			return `Local model ${modelLabel} process exited${message}`;
+	}
+}
+
 function quoteIfNeeded(value: string): string {
 	if (value.length > 0 && !/[^a-zA-Z0-9_\-./~:@]/.test(value)) {
 		return value;
@@ -2839,6 +2868,10 @@ export class InteractiveMode {
 		this.footer.invalidate();
 
 		switch (event.type) {
+			case "local_model_runtime_state":
+				this.showStatus(formatLocalModelRuntimeStatus(event.state));
+				break;
+
 			case "agent_start":
 				this.pendingTools.clear();
 				if (this.settingsManager.getShowTerminalProgress()) {

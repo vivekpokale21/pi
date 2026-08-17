@@ -1,3 +1,4 @@
+import { appendQwen36AgentGuidanceToSystemPrompt } from "./agent-guidance.ts";
 import { appendHierarchicalMemoryToSystemPrompt, compactHierarchicalMemory } from "./memory-compaction.ts";
 
 export function buildQwen36ProfileMemoryBlock(_taskText = ""): string {
@@ -18,5 +19,8 @@ export function buildQwen36ProfileMemoryBlock(_taskText = ""): string {
 }
 
 export function buildQwen36SystemPromptWithMemory(systemPrompt: string, taskText = ""): string {
-	return appendHierarchicalMemoryToSystemPrompt(systemPrompt, buildQwen36ProfileMemoryBlock(taskText));
+	return appendHierarchicalMemoryToSystemPrompt(
+		appendQwen36AgentGuidanceToSystemPrompt(systemPrompt),
+		buildQwen36ProfileMemoryBlock(taskText),
+	);
 }

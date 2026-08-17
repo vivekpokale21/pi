@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { applyPatch } from "diff";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
@@ -50,6 +51,10 @@ function createTinyBmp1x1Red24bpp(): Buffer {
 	return buffer;
 }
 
+function sha256(content: string): string {
+	return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
 describe("Coding Agent Tools", () => {
 	let testDir: string;
 
@@ -76,7 +81,7 @@ describe("Coding Agent Tools", () => {
 			expect(getTextOutput(result)).toBe(content);
 			// No truncation message since file fits within limits
 			expect(getTextOutput(result)).not.toContain("Use offset=");
-			expect(result.details).toBeUndefined();
+			expect(result.details?.truncation).toBeUndefined();
 		});
 
 		it("should handle non-existent files", async () => {
@@ -161,6 +166,217 @@ describe("Coding Agent Tools", () => {
 			expect(output).toContain("[40 more lines in file. Use offset=61 to continue.]");
 		});
 
+		it("should include a read receipt with revision and exact line range for text reads", async () => {
+			const testFile = join(testDir, "receipt-test.txt");
+			const content = ["Line 1", "Line 2", "Line 3", "Line 4"].join("\n");
+			writeFileSync(testFile, content);
+
+			const result = await readTool.execute("test-call-receipt", {
+				path: testFile,
+				offset: 2,
+				limit: 2,
+			});
+
+			expect(getTextOutput(result)).toContain("Line 2\nLine 3");
+			expect(result.details?.receipt).toEqual({
+				path: testFile,
+				revision: sha256(content),
+				mode: "range",
+				range: { startLine: 2, endLine: 3 },
+				totalLines: 4,
+				chunkId: expect.any(String),
+				suggestedNext: [
+					{ action: "expand_above", reason: "Read lines 1-1." },
+					{ action: "expand_below", reason: "Read lines 4-4." },
+				],
+			});
+		});
+
+		it("should return stable chunk identities for the same exact read", async () => {
+			const testFile = join(testDir, "chunk-id-test.txt");
+			const content = ["one", "two", "three", "four"].join("\n");
+			writeFileSync(testFile, content);
+
+			const first = await readTool.execute("test-call-chunk-id-1", {
+				path: testFile,
+				mode: "range",
+				startLine: 2,
+				maxLines: 2,
+			} as any);
+			const second = await readTool.execute("test-call-chunk-id-2", {
+				path: testFile,
+				mode: "range",
+				startLine: 2,
+				maxLines: 2,
+			} as any);
+
+			expect(first.details?.receipt?.chunkId).toBeDefined();
+			expect(first.details?.receipt?.chunkId).toBe(second.details?.receipt?.chunkId);
+			expect(first.details?.receipt?.chunkId).toContain(sha256(content));
+		});
+
+		it("should expand below from an existing read chunk", async () => {
+			const testFile = join(testDir, "expand-below.txt");
+			writeFileSync(testFile, ["one", "two", "three", "four", "five"].join("\n"));
+
+			const first = await readTool.execute("test-call-expand-below-1", {
+				path: testFile,
+				mode: "range",
+				startLine: 2,
+				maxLines: 2,
+			} as any);
+			const chunkId = first.details?.receipt?.chunkId;
+
+			const expanded = await readTool.execute("test-call-expand-below-2", {
+				path: testFile,
+				chunkId,
+				expand: "below",
+				maxLines: 1,
+			} as any);
+
+			expect(getTextOutput(expanded)).toContain("four");
+			expect(getTextOutput(expanded)).not.toContain("three");
+			expect(getTextOutput(expanded)).not.toContain("five");
+			expect(expanded.details?.receipt?.range).toEqual({ startLine: 4, endLine: 4 });
+		});
+
+		it("should expand above from an existing read chunk", async () => {
+			const testFile = join(testDir, "expand-above.txt");
+			writeFileSync(testFile, ["one", "two", "three", "four", "five"].join("\n"));
+
+			const first = await readTool.execute("test-call-expand-above-1", {
+				path: testFile,
+				mode: "range",
+				startLine: 4,
+				maxLines: 1,
+			} as any);
+			const expanded = await readTool.execute("test-call-expand-above-2", {
+				path: testFile,
+				chunkId: first.details?.receipt?.chunkId,
+				expand: "above",
+				maxLines: 2,
+			} as any);
+
+			expect(getTextOutput(expanded)).toContain("two\nthree");
+			expect(getTextOutput(expanded)).not.toContain("one");
+			expect(getTextOutput(expanded)).not.toContain("four");
+			expect(expanded.details?.receipt?.range).toEqual({ startLine: 2, endLine: 3 });
+		});
+
+		it("should expand a symbol read to its parent scope", async () => {
+			const testFile = join(testDir, "expand-parent.ts");
+			writeFileSync(
+				testFile,
+				[
+					"export class Holder {",
+					"\ttarget(): string {",
+					'\t\treturn "target";',
+					"\t}",
+					"",
+					"\tother(): string {",
+					'\t\treturn "other";',
+					"\t}",
+					"}",
+					"",
+				].join("\n"),
+			);
+
+			const symbolRead = await readTool.execute("test-call-expand-parent-1", {
+				path: testFile,
+				symbol: "target",
+			} as any);
+			const expanded = await readTool.execute("test-call-expand-parent-2", {
+				path: testFile,
+				chunkId: symbolRead.details?.receipt?.chunkId,
+				expand: "parent",
+			} as any);
+
+			expect(getTextOutput(expanded)).toContain("export class Holder");
+			expect(getTextOutput(expanded)).toContain("other(): string");
+			expect(expanded.details?.receipt?.range).toEqual({ startLine: 1, endLine: 9 });
+			expect(expanded.details?.receipt?.symbol).toEqual({
+				name: "Holder",
+				kind: "class",
+				startLine: 1,
+				endLine: 9,
+			});
+		});
+
+		it("should reject expansion from a stale read chunk", async () => {
+			const testFile = join(testDir, "stale-chunk.txt");
+			writeFileSync(testFile, ["one", "two", "three"].join("\n"));
+			const first = await readTool.execute("test-call-stale-chunk-1", {
+				path: testFile,
+				mode: "range",
+				startLine: 1,
+				maxLines: 1,
+			} as any);
+
+			writeFileSync(testFile, ["changed", "two", "three"].join("\n"));
+
+			await expect(
+				readTool.execute("test-call-stale-chunk-2", {
+					path: testFile,
+					chunkId: first.details?.receipt?.chunkId,
+					expand: "below",
+				} as any),
+			).rejects.toThrow(/stale read chunk/i);
+		});
+
+		it("should support mode=range with startLine and maxLines", async () => {
+			const testFile = join(testDir, "range-mode.txt");
+			const content = ["one", "two", "three", "four", "five"].join("\n");
+			writeFileSync(testFile, content);
+
+			const result = await readTool.execute("test-call-range-mode", {
+				path: testFile,
+				mode: "range",
+				startLine: 3,
+				maxLines: 2,
+			} as any);
+
+			expect(getTextOutput(result)).toContain("three\nfour");
+			expect(getTextOutput(result)).not.toContain("two");
+			expect(getTextOutput(result)).not.toContain("five");
+			expect(result.details?.receipt).toMatchObject({
+				mode: "range",
+				range: { startLine: 3, endLine: 4 },
+			});
+		});
+
+		it("should support mode=map as the native outline name", async () => {
+			const testFile = join(testDir, "map-mode.ts");
+			writeFileSync(testFile, ["export function mapped(): void {", "}", ""].join("\n"));
+
+			const result = await readTool.execute("test-call-map-mode", { path: testFile, mode: "map" } as any);
+
+			expect(getTextOutput(result)).toContain("<file_outline");
+			expect(getTextOutput(result)).toContain("line 1 function mapped");
+			expect(result.details?.receipt?.mode).toBe("map");
+		});
+
+		it("should support mode=around with bounded context around a line", async () => {
+			const testFile = join(testDir, "around-mode.txt");
+			const content = ["one", "two", "three", "four", "five"].join("\n");
+			writeFileSync(testFile, content);
+
+			const result = await readTool.execute("test-call-around-mode", {
+				path: testFile,
+				mode: "around",
+				line: 3,
+				before: 1,
+				after: 1,
+			} as any);
+
+			expect(getTextOutput(result)).toContain("two\nthree\nfour");
+			expect(getTextOutput(result)).not.toContain("one");
+			expect(getTextOutput(result)).not.toContain("five");
+			expect(result.details?.receipt).toMatchObject({
+				mode: "around",
+				range: { startLine: 2, endLine: 4 },
+			});
+		});
+
 		it("should return a structural outline without dumping the full file", async () => {
 			const testFile = join(testDir, "outline.ts");
 			writeFileSync(
@@ -220,6 +436,42 @@ describe("Coding Agent Tools", () => {
 			expect(output).not.toContain('return "first"');
 			expect(output).not.toContain('return "last"');
 			expect(output).toContain("[Showing symbol target lines 5-8 of 13.]");
+		});
+
+		it("should return symbol candidates without a receipt when a symbol name is ambiguous", async () => {
+			const testFile = join(testDir, "ambiguous-symbol.ts");
+			writeFileSync(
+				testFile,
+				[
+					"export function duplicate(): string {",
+					'\treturn "first";',
+					"}",
+					"",
+					"export class Holder {",
+					"\tduplicate(): string {",
+					'\t\treturn "second";',
+					"\t}",
+					"}",
+					"",
+				].join("\n"),
+			);
+
+			const result = await readTool.execute("test-call-ambiguous-symbol", {
+				path: testFile,
+				symbol: "duplicate",
+			} as any);
+			const output = getTextOutput(result);
+
+			expect(output).toContain("Symbol duplicate is ambiguous in");
+			expect(output).toContain("line 1 function duplicate lines 1-3");
+			expect(output).toContain("line 6 method duplicate lines 6-8");
+			expect(output).not.toContain('return "first"');
+			expect(output).not.toContain('return "second"');
+			expect(result.details?.receipt).toBeUndefined();
+			expect(result.details?.symbolCandidates).toEqual([
+				{ name: "duplicate", kind: "function", startLine: 1, endLine: 3 },
+				{ name: "duplicate", kind: "method", startLine: 6, endLine: 8 },
+			]);
 		});
 
 		it("should show error when offset is beyond file length", async () => {
@@ -397,6 +649,180 @@ describe("Coding Agent Tools", () => {
 			expect(readFileSync(testFile, "utf-8")).toBe("ALPHA\nbeta\nGAMMA\ndelta\n");
 			expect(result.details?.diff).toContain("ALPHA");
 			expect(result.details?.diff).toContain("GAMMA");
+		});
+
+		it("should include an edit receipt with old and new revisions", async () => {
+			const testFile = join(testDir, "edit-receipt.txt");
+			const originalContent = "alpha\nbeta\ngamma\n";
+			writeFileSync(testFile, originalContent);
+
+			const result = await editTool.execute("test-call-edit-receipt", {
+				path: testFile,
+				expectedRevision: sha256(originalContent),
+				edits: [{ oldText: "beta\n", newText: "BETA\n" }],
+			} as any);
+
+			const newContent = "alpha\nBETA\ngamma\n";
+			expect(readFileSync(testFile, "utf-8")).toBe(newContent);
+			expect(result.details?.receipt).toEqual({
+				path: testFile,
+				oldRevision: sha256(originalContent),
+				newRevision: sha256(newContent),
+				editsApplied: 1,
+				oldBytes: Buffer.byteLength(originalContent, "utf-8"),
+				newBytes: Buffer.byteLength(newContent, "utf-8"),
+				changedRanges: [{ startLine: 2, endLine: 2 }],
+			});
+		});
+
+		it("should reject stale expected revisions without modifying the file", async () => {
+			const testFile = join(testDir, "edit-stale-revision.txt");
+			const originalContent = "alpha\nbeta\n";
+			writeFileSync(testFile, originalContent);
+
+			await expect(
+				editTool.execute("test-call-edit-stale-revision", {
+					path: testFile,
+					expectedRevision: sha256("older\ncontent\n"),
+					edits: [{ oldText: "beta\n", newText: "BETA\n" }],
+				} as any),
+			).rejects.toThrow(/stale file revision/i);
+			expect(readFileSync(testFile, "utf-8")).toBe(originalContent);
+		});
+
+		it("should apply a unified diff even when hunk metadata is stale", async () => {
+			const testFile = join(testDir, "edit-patch-stale-metadata.txt");
+			const originalContent = "alpha\nbeta\ngamma\ndelta\n";
+			writeFileSync(testFile, originalContent);
+
+			const result = await editTool.execute("test-call-edit-patch-stale-metadata", {
+				path: testFile,
+				patch: [
+					"--- edit-patch-stale-metadata.txt",
+					"+++ edit-patch-stale-metadata.txt",
+					"@@ -99,99 +88,88 @@",
+					" alpha",
+					"-beta",
+					"+BETA",
+					" gamma",
+					"",
+				].join("\n"),
+			} as any);
+
+			const newContent = "alpha\nBETA\ngamma\ndelta\n";
+			expect(readFileSync(testFile, "utf-8")).toBe(newContent);
+			expect(getTextOutput(result)).toContain(`Successfully applied patch to ${testFile}.`);
+			expect(result.details?.receipt).toMatchObject({
+				path: testFile,
+				oldRevision: sha256(originalContent),
+				newRevision: sha256(newContent),
+				editsApplied: 1,
+				changedRanges: [{ startLine: 2, endLine: 2 }],
+				hunks: [{ index: 0, oldStartLine: 1, oldLineCount: 3, newLineCount: 3 }],
+			});
+			expect(result.details?.patch).toContain("-beta");
+			expect(result.details?.patch).toContain("+BETA");
+		});
+
+		it("should reject ambiguous unified diff hunks without modifying the file", async () => {
+			const testFile = join(testDir, "edit-patch-ambiguous.txt");
+			const originalContent = "alpha\nbeta\ngamma\nalpha\nbeta\ngamma\n";
+			writeFileSync(testFile, originalContent);
+
+			await expect(
+				editTool.execute("test-call-edit-patch-ambiguous", {
+					path: testFile,
+					patch: [
+						"--- edit-patch-ambiguous.txt",
+						"+++ edit-patch-ambiguous.txt",
+						"@@ -1,3 +1,3 @@",
+						" alpha",
+						"-beta",
+						"+BETA",
+						" gamma",
+						"",
+					].join("\n"),
+				} as any),
+			).rejects.toThrow(/ambiguous/i);
+			expect(readFileSync(testFile, "utf-8")).toBe(originalContent);
+		});
+
+		it("should apply a unified diff with unique whitespace-tolerant old-side body", async () => {
+			const testFile = join(testDir, "edit-patch-whitespace.txt");
+			const originalContent = "alpha  \n  beta  \ngamma\n";
+			writeFileSync(testFile, originalContent);
+
+			const result = await editTool.execute("test-call-edit-patch-whitespace", {
+				path: testFile,
+				patch: [
+					"--- edit-patch-whitespace.txt",
+					"+++ edit-patch-whitespace.txt",
+					"@@ -1,3 +1,3 @@",
+					" alpha",
+					"-  beta",
+					"+  BETA",
+					" gamma",
+					"",
+				].join("\n"),
+			} as any);
+
+			expect(readFileSync(testFile, "utf-8")).toBe("alpha  \n  BETA\ngamma\n");
+			expect(getTextOutput(result)).toContain(`Successfully applied patch to ${testFile}.`);
+			expect(result.details?.receipt.changedRanges).toEqual([{ startLine: 2, endLine: 2 }]);
+		});
+
+		it("should apply a unified diff after trimming stale edge context", async () => {
+			const testFile = join(testDir, "edit-patch-trim-context.txt");
+			const originalContent = "alpha\nbeta\ngamma\ndelta\n";
+			writeFileSync(testFile, originalContent);
+
+			const result = await editTool.execute("test-call-edit-patch-trim-context", {
+				path: testFile,
+				patch: [
+					"--- edit-patch-trim-context.txt",
+					"+++ edit-patch-trim-context.txt",
+					"@@ -1,5 +1,5 @@",
+					" stale-before",
+					" alpha",
+					"-beta",
+					"+BETA",
+					" gamma",
+					" stale-after",
+					"",
+				].join("\n"),
+			} as any);
+
+			expect(readFileSync(testFile, "utf-8")).toBe("alpha\nBETA\ngamma\ndelta\n");
+			expect(result.details?.receipt.hunks).toEqual([
+				{ index: 0, oldStartLine: 1, oldLineCount: 3, newLineCount: 3 },
+			]);
+		});
+
+		it("should reject multi-file unified diff input without modifying the file", async () => {
+			const testFile = join(testDir, "edit-patch-multi-file.txt");
+			const originalContent = "alpha\nbeta\n";
+			writeFileSync(testFile, originalContent);
+
+			await expect(
+				editTool.execute("test-call-edit-patch-multi-file", {
+					path: testFile,
+					patch: [
+						"--- edit-patch-multi-file.txt",
+						"+++ edit-patch-multi-file.txt",
+						"@@ -1,2 +1,2 @@",
+						" alpha",
+						"-beta",
+						"+BETA",
+						"--- other.txt",
+						"+++ other.txt",
+						"@@ -1,1 +1,1 @@",
+						"-other",
+						"+OTHER",
+						"",
+					].join("\n"),
+				} as any),
+			).rejects.toThrow(/multi-file unified diff/i);
+			expect(readFileSync(testFile, "utf-8")).toBe(originalContent);
 		});
 
 		it("should collapse large unchanged gaps in multi-edit diffs", async () => {

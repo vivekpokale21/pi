@@ -10,6 +10,7 @@ import {
 	createAgentSessionServices,
 } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import type { LocalModelRuntimeState } from "../src/core/local-model-runtime-manager.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import type {
@@ -35,7 +36,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		}
 	});
 
-	async function createRuntimeHost(extensionFactory: ExtensionFactory) {
+	async function createRuntimeHost(extensionFactory: ExtensionFactory, options?: { modelRuntime?: ModelRuntime }) {
 		const tempDir = join(tmpdir(), `pi-runtime-events-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
 
@@ -44,10 +45,12 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 		const authStorage = AuthStorage.inMemory();
 		await authStorage.modify(faux.getModel().provider, async () => ({ type: "api_key", key: "faux-key" }));
-		const modelRuntime = await ModelRuntime.create({
-			credentials: authStorage,
-			modelsPath: join(tempDir, "models.json"),
-		});
+		const modelRuntime =
+			options?.modelRuntime ??
+			(await ModelRuntime.create({
+				credentials: authStorage,
+				modelsPath: join(tempDir, "models.json"),
+			}));
 		const model = faux.getModel();
 		modelRuntime.registerProvider(model.provider, {
 			baseUrl: model.baseUrl,
@@ -111,6 +114,44 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 		return { runtimeHost, faux };
 	}
+
+	it("forwards local model runtime state through the session event stream", async () => {
+		const stateListeners: Array<(state: LocalModelRuntimeState) => void> = [];
+		const modelRuntime = await ModelRuntime.create({
+			credentials: AuthStorage.inMemory(),
+			modelsPath: null,
+			allowModelNetwork: false,
+			localModelRuntimeManager: {
+				ensureReady: async () => ({ baseUrl: "http://127.0.0.1:49160", apiKey: "local" }),
+				inferenceBaseUrl: (endpoint) => `${endpoint.baseUrl}/v1`,
+				subscribe: (listener) => {
+					stateListeners.push(listener);
+					return () => {};
+				},
+			},
+		});
+		const { runtimeHost } = await createRuntimeHost(() => {}, { modelRuntime });
+		const events: LocalModelRuntimeState[] = [];
+		runtimeHost.session.subscribe((event) => {
+			if (event.type === "local_model_runtime_state") events.push(event.state);
+		});
+
+		stateListeners[0]?.({
+			value: "ready",
+			modelId: "qwen",
+			modelPath: "/tmp/qwen.gguf",
+			baseUrl: "http://127.0.0.1:49160",
+		});
+
+		expect(events).toEqual([
+			{
+				value: "ready",
+				modelId: "qwen",
+				modelPath: "/tmp/qwen.gguf",
+				baseUrl: "http://127.0.0.1:49160",
+			},
+		]);
+	});
 
 	it("emits session_before_switch and session_start for new and resume flows", async () => {
 		const events: RecordedSessionEvent[] = [];

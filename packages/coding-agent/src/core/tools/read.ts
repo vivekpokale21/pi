@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { basename, dirname, isAbsolute, relative, resolve as resolvePath, sep } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
@@ -23,6 +24,9 @@ const readSchema = Type.Object({
 		Type.Union([
 			Type.Literal("full", { description: "Read file contents using offset/limit and truncation." }),
 			Type.Literal("outline", { description: "Return a structural outline without file body contents." }),
+			Type.Literal("range", { description: "Read a bounded line range using startLine/maxLines." }),
+			Type.Literal("map", { description: "Return a structural map without file body contents." }),
+			Type.Literal("around", { description: "Read bounded context around one line." }),
 		]),
 	),
 	symbol: Type.Optional(
@@ -30,12 +34,44 @@ const readSchema = Type.Object({
 	),
 	offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
 	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+	startLine: Type.Optional(Type.Number({ description: "1-indexed first line for mode=range" })),
+	maxLines: Type.Optional(Type.Number({ description: "Maximum lines for mode=range" })),
+	line: Type.Optional(Type.Number({ description: "1-indexed center line for mode=around" })),
+	before: Type.Optional(Type.Number({ description: "Lines before line for mode=around" })),
+	after: Type.Optional(Type.Number({ description: "Lines after line for mode=around" })),
+	chunkId: Type.Optional(Type.String({ description: "Chunk id from a previous exact read receipt." })),
+	expand: Type.Optional(
+		Type.Union([
+			Type.Literal("above", { description: "Read the lines immediately above chunkId." }),
+			Type.Literal("below", { description: "Read the lines immediately below chunkId." }),
+			Type.Literal("parent", { description: "Read the smallest enclosing symbol scope for chunkId." }),
+		]),
+	),
 });
 
 export type ReadToolInput = Static<typeof readSchema>;
 
+export interface ReadReceipt {
+	path: string;
+	revision: string;
+	mode: "range" | "map" | "symbol" | "around";
+	range?: {
+		startLine: number;
+		endLine: number;
+	};
+	chunkId?: string;
+	symbol?: SymbolRange;
+	suggestedNext?: Array<{
+		action: string;
+		reason: string;
+	}>;
+	totalLines: number;
+}
+
 export interface ReadToolDetails {
 	truncation?: TruncationResult;
+	receipt?: ReadReceipt;
+	symbolCandidates?: SymbolRange[];
 }
 
 interface CompactReadClassification {
@@ -78,6 +114,15 @@ interface SymbolRange {
 	kind: string;
 	startLine: number;
 	endLine: number;
+}
+
+interface ParsedChunkId {
+	revision: string;
+	mode: ReadReceipt["mode"];
+	range?: {
+		startLine: number;
+		endLine: number;
+	};
 }
 
 function lineIndent(line: string): number {
@@ -201,6 +246,98 @@ function getNonVisionImageNote(model: Model<Api> | undefined): string | undefine
 		return undefined;
 	}
 	return "[Current model does not support images. The image will be omitted from this request.]";
+}
+
+function sha256(content: string): string {
+	return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+function createChunkId(
+	path: string,
+	revision: string,
+	mode: ReadReceipt["mode"],
+	range: { startLine: number; endLine: number } | undefined,
+): string {
+	const logicalRange = range ? `${range.startLine}-${range.endLine}` : "all";
+	const identity = sha256(`${path}\0${revision}\0${mode}\0${logicalRange}`);
+	return `read:v1:${revision}:${mode}:${logicalRange}:${identity}`;
+}
+
+function parseChunkId(chunkId: string): ParsedChunkId | undefined {
+	const match = /^read:v1:([a-f0-9]{64}):(range|map|symbol|around):(all|\d+-\d+):([a-f0-9]{64})$/.exec(chunkId);
+	if (!match) return undefined;
+	const [, revision, mode, logicalRange] = match;
+	if (!revision || !mode || !logicalRange) return undefined;
+	if (logicalRange === "all") return { revision, mode: mode as ReadReceipt["mode"] };
+	const rangeMatch = /^(\d+)-(\d+)$/.exec(logicalRange);
+	if (!rangeMatch?.[1] || !rangeMatch[2]) return undefined;
+	const startLine = Number.parseInt(rangeMatch[1], 10);
+	const endLine = Number.parseInt(rangeMatch[2], 10);
+	if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine) {
+		return undefined;
+	}
+	return { revision, mode: mode as ReadReceipt["mode"], range: { startLine, endLine } };
+}
+
+function parseAndValidateChunkId(chunkId: string, path: string, revision: string): ParsedChunkId {
+	const parsed = parseChunkId(chunkId);
+	if (!parsed) {
+		throw new Error("Invalid read chunk id.");
+	}
+	if (parsed.revision !== revision) {
+		throw new Error("Cannot expand stale read chunk: file revision has changed.");
+	}
+	if (createChunkId(path, revision, parsed.mode, parsed.range) !== chunkId) {
+		throw new Error("Read chunk id does not match the requested path.");
+	}
+	return parsed;
+}
+
+function suggestedNextForRange(
+	range: { startLine: number; endLine: number } | undefined,
+	totalLines: number,
+): ReadReceipt["suggestedNext"] {
+	if (!range) return undefined;
+	const suggestedNext: NonNullable<ReadReceipt["suggestedNext"]> = [];
+	if (range.startLine > 1) {
+		suggestedNext.push({
+			action: "expand_above",
+			reason: `Read lines 1-${range.startLine - 1}.`,
+		});
+	}
+	if (range.endLine < totalLines) {
+		suggestedNext.push({
+			action: "expand_below",
+			reason: `Read lines ${range.endLine + 1}-${totalLines}.`,
+		});
+	}
+	return suggestedNext.length > 0 ? suggestedNext : undefined;
+}
+
+function createReadReceipt(args: {
+	path: string;
+	revision: string;
+	mode: ReadReceipt["mode"];
+	range?: { startLine: number; endLine: number };
+	symbol?: SymbolRange;
+	totalLines: number;
+}): ReadReceipt {
+	const receipt: ReadReceipt = {
+		path: args.path,
+		revision: args.revision,
+		mode: args.mode,
+		chunkId: createChunkId(args.path, args.revision, args.mode, args.range),
+		totalLines: args.totalLines,
+	};
+	if (args.range) receipt.range = args.range;
+	if (args.symbol) receipt.symbol = args.symbol;
+	const suggestedNext = suggestedNextForRange(args.range, args.totalLines);
+	if (suggestedNext) receipt.suggestedNext = suggestedNext;
+	return receipt;
+}
+
+function withReceipt(details: ReadToolDetails | undefined, receipt: ReadReceipt): ReadToolDetails {
+	return { ...(details ?? {}), receipt };
 }
 
 function toPosixPath(filePath: string): string {
@@ -336,7 +473,14 @@ export function createReadToolDefinition(
 				symbol,
 				offset,
 				limit,
-			}: { path: string; mode?: "full" | "outline"; symbol?: string; offset?: number; limit?: number },
+				startLine: requestedStartLine,
+				maxLines,
+				line,
+				before,
+				after,
+				chunkId,
+				expand,
+			}: ReadToolInput,
 			signal?: AbortSignal,
 			_onUpdate?,
 			ctx?,
@@ -388,72 +532,210 @@ export function createReadToolDefinition(
 								const textContent = buffer.toString("utf-8");
 								const allLines = textContent.split("\n");
 								const totalFileLines = allLines.length;
-								if (mode === "outline") {
+								const fileRevision = sha256(textContent);
+								if (mode === "outline" || mode === "map") {
 									content = [{ type: "text", text: buildFileOutline(path, textContent) }];
+									details = withReceipt(
+										details,
+										createReadReceipt({
+											path: absolutePath,
+											revision: fileRevision,
+											mode: "map",
+											totalLines: totalFileLines,
+										}),
+									);
 								} else if (symbol) {
-									const match = collectSymbolRanges(allLines).find((range) => range.name === symbol);
-									if (!match) {
+									const matches = collectSymbolRanges(allLines).filter((range) => range.name === symbol);
+									if (matches.length === 0) {
 										throw new Error(`Symbol ${symbol} was not found in ${path}`);
 									}
-									const selectedContent = allLines.slice(match.startLine - 1, match.endLine).join("\n");
-									content = [
-										{
-											type: "text",
-											text: `${selectedContent}\n\n[Showing symbol ${symbol} lines ${match.startLine}-${match.endLine} of ${totalFileLines}.]`,
-										},
-									];
-								} else {
-									// Apply offset if specified. Convert from 1-indexed input to 0-indexed array access.
-									const startLine = offset ? Math.max(0, offset - 1) : 0;
-									const startLineDisplay = startLine + 1;
-									// Check if offset is out of bounds.
-									if (startLine >= allLines.length) {
-										throw new Error(
-											`Offset ${offset} is beyond end of file (${allLines.length} lines total)`,
+									if (matches.length > 1) {
+										const candidates = matches
+											.map(
+												(candidate) =>
+													`line ${candidate.startLine} ${candidate.kind} ${candidate.name} lines ${candidate.startLine}-${candidate.endLine}`,
+											)
+											.join("\n");
+										content = [
+											{
+												type: "text",
+												text: `Symbol ${symbol} is ambiguous in ${path}. Candidates:\n${candidates}`,
+											},
+										];
+										details = { symbolCandidates: matches };
+									} else {
+										const match = matches[0];
+										if (!match) {
+											throw new Error(`Symbol ${symbol} was not found in ${path}`);
+										}
+										const selectedContent = allLines.slice(match.startLine - 1, match.endLine).join("\n");
+										content = [
+											{
+												type: "text",
+												text: `${selectedContent}\n\n[Showing symbol ${symbol} lines ${match.startLine}-${match.endLine} of ${totalFileLines}.]`,
+											},
+										];
+										details = withReceipt(
+											details,
+											createReadReceipt({
+												path: absolutePath,
+												revision: fileRevision,
+												mode: "symbol",
+												range: { startLine: match.startLine, endLine: match.endLine },
+												symbol: match,
+												totalLines: totalFileLines,
+											}),
 										);
 									}
-									let selectedContent: string;
-									let userLimitedLines: number | undefined;
-									// If limit is specified by the user, honor it first. Otherwise truncateHead decides.
-									if (limit !== undefined) {
-										const endLine = Math.min(startLine + limit, allLines.length);
-										selectedContent = allLines.slice(startLine, endLine).join("\n");
-										userLimitedLines = endLine - startLine;
-									} else {
-										selectedContent = allLines.slice(startLine).join("\n");
-									}
-									// Apply truncation, respecting both line and byte limits.
-									const truncation = truncateHead(selectedContent);
-									let outputText: string;
-									if (truncation.firstLineExceedsLimit) {
-										// First line alone exceeds the byte limit. Point the model at a bash fallback.
-										const firstLineSize = formatSize(Buffer.byteLength(allLines[startLine], "utf-8"));
-										outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
-										details = { truncation };
-									} else if (truncation.truncated) {
-										// Truncation occurred. Build an actionable continuation notice.
-										const endLineDisplay = startLineDisplay + truncation.outputLines - 1;
-										const nextOffset = endLineDisplay + 1;
-										outputText = truncation.content;
-										if (truncation.truncatedBy === "lines") {
-											outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines}. Use offset=${nextOffset} to continue.]`;
-										} else {
-											outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Use offset=${nextOffset} to continue.]`;
+								} else {
+									if (expand === "parent") {
+										if (!chunkId) {
+											throw new Error("chunkId is required when expand is provided.");
 										}
-										details = { truncation };
-									} else if (
-										userLimitedLines !== undefined &&
-										startLine + userLimitedLines < allLines.length
-									) {
-										// User-specified limit stopped early, but the file still has more content.
-										const remaining = allLines.length - (startLine + userLimitedLines);
-										const nextOffset = startLine + userLimitedLines + 1;
-										outputText = `${truncation.content}\n\n[${remaining} more lines in file. Use offset=${nextOffset} to continue.]`;
+										const parsedChunk = parseAndValidateChunkId(chunkId, absolutePath, fileRevision);
+										if (!parsedChunk.range) {
+											throw new Error("Cannot expand a read chunk without a line range.");
+										}
+										const chunkRange = parsedChunk.range;
+										const parent = collectSymbolRanges(allLines)
+											.filter(
+												(range) =>
+													range.startLine < chunkRange.startLine && range.endLine >= chunkRange.endLine,
+											)
+											.sort(
+												(left, right) => left.endLine - left.startLine - (right.endLine - right.startLine),
+											)[0];
+										if (!parent) {
+											throw new Error("No parent scope found for read chunk.");
+										}
+										const selectedContent = allLines.slice(parent.startLine - 1, parent.endLine).join("\n");
+										content = [
+											{
+												type: "text",
+												text: `${selectedContent}\n\n[Showing parent scope ${parent.name} lines ${parent.startLine}-${parent.endLine} of ${totalFileLines}.]`,
+											},
+										];
+										details = withReceipt(
+											details,
+											createReadReceipt({
+												path: absolutePath,
+												revision: fileRevision,
+												mode: "symbol",
+												range: { startLine: parent.startLine, endLine: parent.endLine },
+												symbol: parent,
+												totalLines: totalFileLines,
+											}),
+										);
 									} else {
-										// No truncation and no remaining user-limited content.
-										outputText = truncation.content;
+										// Apply offset if specified. Convert from 1-indexed input to 0-indexed array access.
+										let readMode: "range" | "around" = mode === "around" ? "around" : "range";
+										let requestedLine = offset ?? requestedStartLine ?? 1;
+										let expansionLimit: number | undefined;
+										if (expand) {
+											if (!chunkId) {
+												throw new Error("chunkId is required when expand is provided.");
+											}
+											const parsedChunk = parseAndValidateChunkId(chunkId, absolutePath, fileRevision);
+											if (!parsedChunk.range) {
+												throw new Error("Cannot expand a read chunk without a line range.");
+											}
+											const chunkRange = parsedChunk.range;
+											readMode = "range";
+											const requestedExpansionLines = Math.max(1, Math.floor(maxLines ?? limit ?? 20));
+											if (expand === "below") {
+												if (chunkRange.endLine >= totalFileLines) {
+													throw new Error("Cannot expand below: read chunk already reaches end of file.");
+												}
+												requestedLine = chunkRange.endLine + 1;
+												expansionLimit = requestedExpansionLines;
+											} else {
+												if (chunkRange.startLine <= 1) {
+													throw new Error(
+														"Cannot expand above: read chunk already starts at beginning of file.",
+													);
+												}
+												const expansionStartLine = Math.max(
+													1,
+													chunkRange.startLine - requestedExpansionLines,
+												);
+												requestedLine = expansionStartLine;
+												expansionLimit = chunkRange.startLine - expansionStartLine;
+											}
+										}
+										const startLine =
+											mode === "around" && !expand
+												? Math.max(0, Math.floor((line ?? 1) - (before ?? 20) - 1))
+												: Math.max(0, Math.floor(requestedLine - 1));
+										const startLineDisplay = startLine + 1;
+										// Check if offset is out of bounds.
+										if (startLine >= allLines.length) {
+											const label =
+												offset !== undefined ? `Offset ${offset}` : `Start line ${startLineDisplay}`;
+											throw new Error(`${label} is beyond end of file (${allLines.length} lines total)`);
+										}
+										let selectedContent: string;
+										let userLimitedLines: number | undefined;
+										// If limit is specified by the user, honor it first. Otherwise truncateHead decides.
+										const effectiveLimit =
+											expansionLimit ??
+											(mode === "around" && !expand
+												? Math.max(0, Math.floor((line ?? 1) - startLine + (after ?? 20)))
+												: (limit ?? maxLines));
+										if (effectiveLimit !== undefined) {
+											const endLine = Math.min(startLine + effectiveLimit, allLines.length);
+											selectedContent = allLines.slice(startLine, endLine).join("\n");
+											userLimitedLines = endLine - startLine;
+										} else {
+											selectedContent = allLines.slice(startLine).join("\n");
+										}
+										// Apply truncation, respecting both line and byte limits.
+										const truncation = truncateHead(selectedContent);
+										let outputText: string;
+										if (truncation.firstLineExceedsLimit) {
+											// First line alone exceeds the byte limit. Point the model at a bash fallback.
+											const firstLineSize = formatSize(Buffer.byteLength(allLines[startLine], "utf-8"));
+											outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
+											details = { truncation };
+										} else if (truncation.truncated) {
+											// Truncation occurred. Build an actionable continuation notice.
+											const endLineDisplay = startLineDisplay + truncation.outputLines - 1;
+											const nextOffset = endLineDisplay + 1;
+											outputText = truncation.content;
+											if (truncation.truncatedBy === "lines") {
+												outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines}. Use offset=${nextOffset} to continue.]`;
+											} else {
+												outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Use offset=${nextOffset} to continue.]`;
+											}
+											details = { truncation };
+										} else if (
+											userLimitedLines !== undefined &&
+											startLine + userLimitedLines < allLines.length
+										) {
+											// User-specified limit stopped early, but the file still has more content.
+											const remaining = allLines.length - (startLine + userLimitedLines);
+											const nextOffset = startLine + userLimitedLines + 1;
+											outputText = `${truncation.content}\n\n[${remaining} more lines in file. Use offset=${nextOffset} to continue.]`;
+										} else {
+											// No truncation and no remaining user-limited content.
+											outputText = truncation.content;
+										}
+										if (!truncation.firstLineExceedsLimit) {
+											details = withReceipt(
+												details,
+												createReadReceipt({
+													path: absolutePath,
+													revision: fileRevision,
+													mode: readMode,
+													range: {
+														startLine: startLineDisplay,
+														endLine: startLineDisplay + truncation.outputLines - 1,
+													},
+													totalLines: totalFileLines,
+												}),
+											);
+										}
+										content = [{ type: "text", text: outputText }];
 									}
-									content = [{ type: "text", text: outputText }];
 								}
 							}
 

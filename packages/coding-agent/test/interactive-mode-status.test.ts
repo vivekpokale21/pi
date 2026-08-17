@@ -5,6 +5,7 @@ import { beforeAll, describe, expect, test, vi } from "vitest";
 import { type Component, Container, type Focusable, TUI } from "../../tui/src/tui.ts";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.ts";
+import type { LocalModelRuntimeState } from "../src/core/local-model-runtime-manager.ts";
 import type { SourceInfo } from "../src/core/source-info.ts";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
@@ -114,6 +115,46 @@ describe("InteractiveMode.showStatus", () => {
 		// adds spacer + text
 		expect(fakeThis.chatContainer.children).toHaveLength(5);
 		expect(renderLastLine(fakeThis.chatContainer)).toContain("STATUS_TWO");
+	});
+
+	test("shows local model runtime state events as status messages", async () => {
+		const statuses: string[] = [];
+		const fakeThis: any = {
+			isInitialized: true,
+			footer: { invalidate: vi.fn() },
+			showStatus: vi.fn((message: string) => statuses.push(message)),
+		};
+
+		const emitLocalState = (state: LocalModelRuntimeState) =>
+			(InteractiveMode as any).prototype.handleEvent.call(fakeThis, {
+				type: "local_model_runtime_state",
+				state,
+			});
+
+		await emitLocalState({
+			value: "loading_model",
+			modelId: "qwen",
+			modelPath: "/tmp/qwen.gguf",
+			baseUrl: "http://127.0.0.1:49160",
+		});
+		await emitLocalState({
+			value: "ready",
+			modelId: "qwen",
+			modelPath: "/tmp/qwen.gguf",
+			baseUrl: "http://127.0.0.1:49160",
+		});
+		await emitLocalState({
+			value: "runtime_unavailable",
+			modelId: "qwen",
+			modelPath: "/tmp/qwen.gguf",
+			message: "llama-server is not available: llama-server",
+		});
+
+		expect(statuses).toEqual([
+			"Loading local model qwen...",
+			"Local model qwen ready at http://127.0.0.1:49160",
+			"Local model qwen runtime unavailable: llama-server is not available: llama-server",
+		]);
 	});
 });
 

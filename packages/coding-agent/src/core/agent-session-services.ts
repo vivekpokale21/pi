@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.ts";
@@ -13,7 +13,10 @@ import {
 } from "./resource-loader.ts";
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./sdk.ts";
 import type { SessionManager } from "./session-manager.ts";
-import { SettingsManager } from "./settings-manager.ts";
+import { type PackageSource, SettingsManager } from "./settings-manager.ts";
+import { createOpenAICompatibleWorkspaceEmbeddingProvider } from "./workspace-embedding-provider.ts";
+import { WorkspaceEmbeddingRuntimeManager } from "./workspace-embedding-runtime-manager.ts";
+import { WorkspaceSemanticIndex, type WorkspaceSemanticIndexOptions } from "./workspace-semantic-index.ts";
 
 /**
  * Non-fatal issues collected while creating services or sessions.
@@ -42,6 +45,8 @@ export interface CreateAgentSessionServicesOptions {
 	extensionFlagValues?: Map<string, boolean | string>;
 	resourceLoaderOptions?: Omit<DefaultResourceLoaderOptions, "cwd" | "agentDir" | "settingsManager">;
 	resourceLoaderReloadOptions?: ResourceLoaderReloadOptions;
+	semanticIndexOptions?: WorkspaceSemanticIndexOptions;
+	disposeModelRuntime?: boolean;
 }
 
 /**
@@ -75,7 +80,10 @@ export interface AgentSessionServices {
 	modelRuntime: ModelRuntime;
 	settingsManager: SettingsManager;
 	resourceLoader: ResourceLoader;
+	semanticIndex: WorkspaceSemanticIndex;
+	embeddingRuntime?: WorkspaceEmbeddingRuntimeManager;
 	diagnostics: AgentSessionRuntimeDiagnostic[];
+	dispose?: () => Promise<void>;
 }
 
 function applyExtensionFlagValues(
@@ -126,6 +134,85 @@ function applyExtensionFlagValues(
 	return diagnostics;
 }
 
+function isPiWebAccessPackageSource(source: string): boolean {
+	const normalized = source.replace(/\\/g, "/");
+	if (normalized.startsWith("npm:")) {
+		const npmSpec = normalized.slice("npm:".length);
+		return npmSpec === "pi-web-access" || npmSpec.startsWith("pi-web-access@");
+	}
+	return basename(normalized) === "pi-web-access";
+}
+
+function sourceFromPackageSource(pkg: PackageSource): string {
+	return typeof pkg === "string" ? pkg : pkg.source;
+}
+
+function collectWebAccessCapabilityDiagnostics(
+	settingsManager: SettingsManager,
+	resourceLoader: ResourceLoader,
+): AgentSessionRuntimeDiagnostic[] {
+	const hasConfiguredWebAccess = settingsManager
+		.getPackages()
+		.some((pkg) => isPiWebAccessPackageSource(sourceFromPackageSource(pkg)));
+	if (!hasConfiguredWebAccess) {
+		return [];
+	}
+
+	const registeredToolNames = new Set<string>();
+	for (const extension of resourceLoader.getExtensions().extensions) {
+		for (const toolName of extension.tools.keys()) {
+			registeredToolNames.add(toolName);
+		}
+	}
+
+	if (registeredToolNames.has("web_search") || registeredToolNames.has("fetch_content")) {
+		return [];
+	}
+
+	return [
+		{
+			type: "info",
+			message: "Web access is configured through pi-web-access, but web tools are unavailable or disabled.",
+		},
+	];
+}
+
+function parsePositiveInteger(value: string | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	const parsed = Number(value);
+	return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+export function createSemanticIndexOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): WorkspaceSemanticIndexOptions {
+	const baseUrl = env.PI_SEMANTIC_EMBEDDING_BASE_URL;
+	const model = env.PI_SEMANTIC_EMBEDDING_MODEL;
+	const startCommand = env.PI_SEMANTIC_EMBEDDING_START_COMMAND;
+	const embeddingBatchSize = parsePositiveInteger(env.PI_SEMANTIC_EMBEDDING_BATCH_SIZE);
+	const embeddingRuntime =
+		baseUrl && startCommand
+			? new WorkspaceEmbeddingRuntimeManager({
+					baseUrl,
+					startCommand,
+				})
+			: undefined;
+	return {
+		...(embeddingBatchSize ? { embeddingBatchSize } : {}),
+		...(baseUrl && model
+			? {
+					embedding: createOpenAICompatibleWorkspaceEmbeddingProvider({
+						baseUrl,
+						model,
+						apiKey: env.PI_SEMANTIC_EMBEDDING_API_KEY,
+						resolveBaseUrl: embeddingRuntime
+							? async (signal) => (await embeddingRuntime.ensureReady(signal)).baseUrl
+							: undefined,
+					}),
+				}
+			: {}),
+		...(embeddingRuntime ? { embeddingRuntime } : {}),
+	};
+}
+
 /**
  * Create cwd-bound runtime services.
  *
@@ -136,6 +223,8 @@ export async function createAgentSessionServices(
 ): Promise<AgentSessionServices> {
 	const cwd = resolvePath(options.cwd);
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getAgentDir();
+	const ownsModelRuntime = !options.modelRuntime;
+	const disposeModelRuntime = options.disposeModelRuntime ?? ownsModelRuntime;
 	const modelRuntime =
 		options.modelRuntime ??
 		(await ModelRuntime.create({
@@ -143,6 +232,17 @@ export async function createAgentSessionServices(
 			modelsPath: join(agentDir, "models.json"),
 		}));
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+	const envSemanticIndexOptions = createSemanticIndexOptionsFromEnv();
+	const semanticIndexOptions = {
+		...envSemanticIndexOptions,
+		...options.semanticIndexOptions,
+	};
+	const semanticIndex = new WorkspaceSemanticIndex(cwd, {
+		...semanticIndexOptions,
+		watch: true,
+	});
+	const embeddingRuntime = semanticIndexOptions.embeddingRuntime;
+	semanticIndex.start();
 	const resourceLoader = new DefaultResourceLoader({
 		...(options.resourceLoaderOptions ?? {}),
 		cwd,
@@ -179,6 +279,7 @@ export async function createAgentSessionServices(
 	extensionsResult.runtime.pendingNativeProviderRegistrations = [];
 	await modelRuntime.refresh({ allowNetwork: false });
 	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
+	diagnostics.push(...collectWebAccessCapabilityDiagnostics(settingsManager, resourceLoader));
 
 	return {
 		cwd,
@@ -187,6 +288,13 @@ export async function createAgentSessionServices(
 		settingsManager,
 		resourceLoader,
 		diagnostics,
+		semanticIndex,
+		embeddingRuntime,
+		dispose: async () => {
+			semanticIndex.cancel();
+			await embeddingRuntime?.shutdown();
+			if (disposeModelRuntime) await modelRuntime.dispose();
+		},
 	};
 }
 
@@ -214,6 +322,7 @@ export async function createAgentSessionFromServices(
 		excludeTools: options.excludeTools,
 		noTools: options.noTools,
 		customTools: options.customTools,
+		semanticIndex: options.services.semanticIndex,
 		sessionStartEvent: options.sessionStartEvent,
 	});
 }

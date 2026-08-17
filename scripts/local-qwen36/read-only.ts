@@ -8,6 +8,8 @@ export const PLANNER_TOOL_NAMES = [
 	"lsp_symbols",
 	"semantic_search",
 	"read_file",
+	"web_fetch",
+	"web_search",
 ] as const;
 export const EXECUTOR_TOOL_NAMES = [
 	"read",
@@ -23,6 +25,8 @@ export const EXECUTOR_TOOL_NAMES = [
 	"lsp_symbols",
 	"semantic_search",
 	"read_file",
+	"web_fetch",
+	"web_search",
 ] as const;
 
 const MUTATING_TOOL_NAMES = new Set(["edit", "write", "write_marker", "apply_diff", "bash_write"]);

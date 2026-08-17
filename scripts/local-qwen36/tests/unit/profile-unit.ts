@@ -1,5 +1,6 @@
 #!/usr/bin/env -S node --import tsx
 import assert from "node:assert/strict";
+import { buildQwen36SystemPromptWithMemory } from "../../profile-memory.ts";
 import { applyQwen36ProfileToPayload, createLocalQwen36Model, getQwen36Profile } from "../../profiles.ts";
 import { EXECUTOR_TOOL_NAMES, isPlannerToolAllowed, isReadOnlyBash, PLANNER_TOOL_NAMES } from "../../read-only.ts";
 
@@ -63,6 +64,10 @@ assert.equal(EXECUTOR_TOOL_NAMES.includes("lsp_symbols"), true);
 assert.equal(PLANNER_TOOL_NAMES.includes("lsp_symbols"), true);
 assert.equal(EXECUTOR_TOOL_NAMES.includes("semantic_search"), true);
 assert.equal(PLANNER_TOOL_NAMES.includes("semantic_search"), true);
+assert.equal(EXECUTOR_TOOL_NAMES.includes("web_fetch"), true);
+assert.equal(PLANNER_TOOL_NAMES.includes("web_fetch"), true);
+assert.equal(EXECUTOR_TOOL_NAMES.includes("web_search"), true);
+assert.equal(PLANNER_TOOL_NAMES.includes("web_search"), true);
 
 assert.equal(isReadOnlyBash("rg planner scripts"), true);
 assert.equal(isReadOnlyBash("git status --short"), true);
@@ -78,5 +83,29 @@ assert.equal(model.reasoning, true);
 assert.equal(model.maxTokens, 0);
 assert.equal(model.compat?.thinkingFormat, "qwen-chat-template");
 assert.equal(model.compat?.supportsDeveloperRole, false);
+
+function assertGuidedPrompt(prompt: string, profileText: string): void {
+	assert.equal(prompt.includes(profileText), true);
+	assert.match(prompt, /<qwen36_agent_guidance>/);
+	assert.match(prompt, /Search results and snippets are navigation evidence, not an editing substrate\./);
+	assert.match(prompt, /Before editing existing code, read the defining symbol or focused region with read_file\./);
+	assert.match(prompt, /Planner should gather repository\/file structure, relevant files and symbols, architectural relationships, known failures and verification state\./);
+	assert.match(prompt, /Executor should gather exact implementation regions, directly related callers\/callees\/types\/tests, recent diagnostics, current file revisions before editing\./);
+	assert.match(prompt, /Treat apply_diff receipts as write verification only\./);
+	assert.match(prompt, /<qwen36_memory>/);
+	assert.equal(prompt.indexOf(profileText) < prompt.indexOf("<qwen36_agent_guidance>"), true);
+	assert.equal(prompt.indexOf("<qwen36_agent_guidance>") < prompt.indexOf("<qwen36_memory>"), true);
+	assert.equal(prompt.match(/<qwen36_agent_guidance>/g)?.length, 1);
+	assert.equal(prompt.match(/<qwen36_memory>/g)?.length, 1);
+}
+
+assertGuidedPrompt(
+	buildQwen36SystemPromptWithMemory(planner.systemPrompt, "inspect the retry implementation"),
+	planner.systemPrompt,
+);
+assertGuidedPrompt(
+	buildQwen36SystemPromptWithMemory(executor.systemPrompt, "edit the retry implementation"),
+	executor.systemPrompt,
+);
 
 console.log("profile-unit: ok");

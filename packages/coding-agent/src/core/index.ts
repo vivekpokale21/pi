@@ -24,6 +24,7 @@ export {
 	type CreateAgentSessionServicesOptions,
 	createAgentSessionFromServices,
 	createAgentSessionServices,
+	createSemanticIndexOptionsFromEnv,
 } from "./agent-session-services.ts";
 export { type BashExecutorOptions, type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 export type { CompactionResult } from "./compaction/index.ts";
@@ -77,4 +78,67 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export {
+	createNativeBenchmarkCliPlan,
+	declareNativeBenchmarkCapabilities,
+	getNativeDubaiBoomBenchmarkTasks,
+	type NativeBenchmarkCapabilityDeclaration,
+	type NativeBenchmarkCapabilityOptions,
+	type NativeBenchmarkCliOptions,
+	type NativeBenchmarkCliPlan,
+	type NativeBenchmarkCorpusArtifacts,
+	type NativeBenchmarkCorpusOptions,
+	type NativeBenchmarkCorpusResult,
+	type NativeBenchmarkEventTrace,
+	type NativeBenchmarkJsonlTraceEntry,
+	type NativeBenchmarkSemanticEmbeddingOptions,
+	type NativeBenchmarkShellCommandValidationOptions,
+	type NativeBenchmarkShellCommandValidationResult,
+	type NativeBenchmarkTask,
+	type NativeBenchmarkTaskCorpus,
+	type NativeBenchmarkTaskOptions,
+	type NativeBenchmarkTaskResult,
+	type NativeBenchmarkValidationOptions,
+	type NativeBenchmarkValidationResult,
+	type NativeBenchmarkWebAccessStatus,
+	type NativeBenchmarkWorkspace,
+	type NativeBenchmarkWorkspaceOptions,
+	nativeBenchmarkCorpusSummaryMarkdown,
+	nativeBenchmarkJsonlTraceEntries,
+	nativeBenchmarkMarkdownReport,
+	runNativeBenchmarkCli,
+	runNativeBenchmarkCorpus,
+	runNativeBenchmarkTask,
+	validateNativeBenchmarkShellCommand,
+	writeNativeBenchmarkCorpusArtifacts,
+	writeNativeBenchmarkJsonlTrace,
+	writeNativeBenchmarkMarkdownReport,
+} from "./native-benchmark.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";
+export {
+	createOpenAICompatibleWorkspaceEmbeddingProvider,
+	type OpenAICompatibleWorkspaceEmbeddingProviderOptions,
+} from "./workspace-embedding-provider.ts";
+export {
+	type WorkspaceEmbeddingRuntimeEndpoint,
+	WorkspaceEmbeddingRuntimeError,
+	WorkspaceEmbeddingRuntimeManager,
+	type WorkspaceEmbeddingRuntimeManagerOptions,
+	type WorkspaceEmbeddingRuntimeOperations,
+	type WorkspaceEmbeddingRuntimeProcess,
+	type WorkspaceEmbeddingRuntimeStartOptions,
+	type WorkspaceEmbeddingRuntimeState,
+	type WorkspaceEmbeddingRuntimeStateValue,
+} from "./workspace-embedding-runtime-manager.ts";
+export {
+	type WorkspaceSemanticEmbeddingProvider,
+	WorkspaceSemanticIndex,
+	type WorkspaceSemanticIndexOptions,
+	type WorkspaceSemanticIndexResult,
+	type WorkspaceSemanticIndexStatus,
+	type WorkspaceSemanticRelatedContext,
+	type WorkspaceSemanticRerankCandidate,
+	type WorkspaceSemanticRerankProvider,
+	type WorkspaceSemanticSearchResponse,
+	type WorkspaceSemanticVectorStatus,
+} from "./workspace-semantic-index.ts";

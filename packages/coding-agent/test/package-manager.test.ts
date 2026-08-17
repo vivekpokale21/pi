@@ -717,6 +717,7 @@ Content`,
 					"--prefix",
 					join(agentDir, "npm"),
 					"--legacy-peer-deps",
+					"--ignore-scripts",
 				],
 				undefined,
 			);
@@ -751,7 +752,18 @@ Content`,
 
 			expect(runCommandSpy).toHaveBeenCalledWith(
 				"mise",
-				["exec", "bun@1", "--", "bun", "install", "@scope/pkg", "--cwd", join(agentDir, "npm"), "--omit=peer"],
+				[
+					"exec",
+					"bun@1",
+					"--",
+					"bun",
+					"install",
+					"@scope/pkg",
+					"--cwd",
+					join(agentDir, "npm"),
+					"--omit=peer",
+					"--ignore-scripts",
+				],
 				undefined,
 			);
 		});
@@ -993,6 +1005,7 @@ Content`,
 						"--config.auto-install-peers=false",
 						"--config.strict-peer-dependencies=false",
 						"--config.strict-dep-builds=false",
+						"--ignore-scripts",
 					]);
 					mkdirSync(join(packagePath, "extensions"), { recursive: true });
 					writeFileSync(join(packagePath, "package.json"), JSON.stringify({ name: "pnpm-pkg", version: "1.0.0" }));
@@ -2137,7 +2150,14 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			);
 			expect(runCommandSpy).toHaveBeenCalledWith(
 				"npm",
-				["install", "example@^1.0.0", "--prefix", join(tempDir, ".pi", "npm"), "--legacy-peer-deps"],
+				[
+					"install",
+					"example@^1.0.0",
+					"--prefix",
+					join(tempDir, ".pi", "npm"),
+					"--legacy-peer-deps",
+					"--ignore-scripts",
+				],
 				undefined,
 			);
 		});
@@ -2184,6 +2204,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 						"--prefix",
 						join(agentDir, "npm"),
 						"--legacy-peer-deps",
+						"--ignore-scripts",
 					]);
 					mkdirSync(managedPath, { recursive: true });
 					writeFileSync(
@@ -2301,6 +2322,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 					"--prefix",
 					join(agentDir, "npm"),
 					"--legacy-peer-deps",
+					"--ignore-scripts",
 				],
 				undefined,
 			);
@@ -2314,6 +2336,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 					"--prefix",
 					join(tempDir, ".pi", "npm"),
 					"--legacy-peer-deps",
+					"--ignore-scripts",
 				],
 				undefined,
 			);

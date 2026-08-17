@@ -21,7 +21,7 @@ import { createJiti } from "jiti/static";
 import * as _bundledTypebox from "typebox";
 import * as _bundledTypeboxCompile from "typebox/compile";
 import * as _bundledTypeboxValue from "typebox/value";
-import { CONFIG_DIR_NAME, getAgentDir, isBunBinary } from "../../config.ts";
+import { CONFIG_DIR_NAME, ENV_AGENT_DIR, getAgentDir, isBunBinary } from "../../config.ts";
 // NOTE: This import works because loader.ts exports are NOT re-exported from index.ts,
 // avoiding a circular dependency. Extensions can import from @earendil-works/pi-coding-agent.
 import * as _bundledPiCodingAgent from "../../index.ts";
@@ -84,31 +84,55 @@ function getAliases(): Record<string, string> {
 
 	const __dirname = path.dirname(fileURLToPath(import.meta.url));
 	const packageIndex = path.resolve(__dirname, "../..", "index.js");
+	const packageSourceIndex = path.resolve(__dirname, "../..", "index.ts");
 
 	const typeboxEntry = require.resolve("typebox");
 	const typeboxCompileEntry = require.resolve("typebox/compile");
 	const typeboxValueEntry = require.resolve("typebox/value");
 
 	const packagesRoot = path.resolve(__dirname, "../../../../");
-	const resolveWorkspaceOrImport = (workspaceRelativePath: string, specifier: string): string => {
+	const resolveWorkspaceOrImport = (
+		workspaceRelativePath: string,
+		specifier: string,
+		sourceWorkspaceRelativePath?: string,
+	): string => {
 		const workspacePath = path.join(packagesRoot, workspaceRelativePath);
 		if (fs.existsSync(workspacePath)) {
 			return workspacePath;
 		}
+		if (sourceWorkspaceRelativePath) {
+			const sourceWorkspacePath = path.join(packagesRoot, sourceWorkspaceRelativePath);
+			if (fs.existsSync(sourceWorkspacePath)) {
+				return sourceWorkspacePath;
+			}
+		}
 		return fileURLToPath(import.meta.resolve(specifier));
 	};
 
-	const piCodingAgentEntry = packageIndex;
-	const piAgentCoreEntry = resolveWorkspaceOrImport("agent/dist/index.js", "@earendil-works/pi-agent-core");
-	const piTuiEntry = resolveWorkspaceOrImport("tui/dist/index.js", "@earendil-works/pi-tui");
+	const piCodingAgentEntry = fs.existsSync(packageIndex) ? packageIndex : packageSourceIndex;
+	const piAgentCoreEntry = resolveWorkspaceOrImport(
+		"agent/dist/index.js",
+		"@earendil-works/pi-agent-core",
+		"agent/src/index.ts",
+	);
+	const piTuiEntry = resolveWorkspaceOrImport("tui/dist/index.js", "@earendil-works/pi-tui", "tui/src/index.ts");
 	// Extensions resolve the pi-ai root to the compat entrypoint (a strict
 	// superset of the core entrypoint): existing extensions using the old
 	// global API keep working at runtime until compat is removed.
-	const piAiCompatEntry = resolveWorkspaceOrImport("ai/dist/compat.js", "@earendil-works/pi-ai/compat");
-	const piAiOauthEntry = resolveWorkspaceOrImport("ai/dist/oauth.js", "@earendil-works/pi-ai/oauth");
+	const piAiCompatEntry = resolveWorkspaceOrImport(
+		"ai/dist/compat.js",
+		"@earendil-works/pi-ai/compat",
+		"ai/src/compat.ts",
+	);
+	const piAiOauthEntry = resolveWorkspaceOrImport(
+		"ai/dist/oauth.js",
+		"@earendil-works/pi-ai/oauth",
+		"ai/src/oauth.ts",
+	);
 	const piAiProvidersEntry = resolveWorkspaceOrImport(
 		"ai/dist/providers/all.js",
 		"@earendil-works/pi-ai/providers/all",
+		"ai/src/providers/all.ts",
 	);
 
 	_aliases = {
@@ -139,28 +163,31 @@ function getAliases(): Record<string, string> {
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
-let extensionCacheCwd: string | undefined;
+let extensionCacheScopeKey: string | undefined;
 let extensionCacheGeneration = 0;
 const extensionCache = new Map<string, ExtensionFactory>();
 
 interface ExtensionCacheToken {
 	cwd: string;
+	scopeKey: string;
 	generation: number;
 }
 
 export function clearExtensionCache(): void {
 	extensionCache.clear();
-	extensionCacheCwd = undefined;
+	extensionCacheScopeKey = undefined;
 	extensionCacheGeneration++;
 }
 
-function useExtensionCacheCwd(cwd: string): ExtensionCacheToken {
+function useExtensionCacheCwd(cwd: string, agentDir?: string): ExtensionCacheToken {
 	const resolvedCwd = resolvePath(cwd);
-	if (extensionCacheCwd !== undefined && extensionCacheCwd !== resolvedCwd) {
+	const resolvedAgentDir = agentDir ? resolvePath(agentDir) : "";
+	const scopeKey = `${resolvedCwd}\0${resolvedAgentDir}`;
+	if (extensionCacheScopeKey !== undefined && extensionCacheScopeKey !== scopeKey) {
 		clearExtensionCache();
 	}
-	extensionCacheCwd = resolvedCwd;
-	return { cwd: resolvedCwd, generation: extensionCacheGeneration };
+	extensionCacheScopeKey = scopeKey;
+	return { cwd: resolvedCwd, scopeKey, generation: extensionCacheGeneration };
 }
 
 /**
@@ -395,12 +422,30 @@ function createExtensionAPI(
 function isCurrentCacheToken(cacheToken: ExtensionCacheToken | undefined): cacheToken is ExtensionCacheToken {
 	return (
 		cacheToken !== undefined &&
-		extensionCacheCwd === cacheToken.cwd &&
+		extensionCacheScopeKey === cacheToken.scopeKey &&
 		extensionCacheGeneration === cacheToken.generation
 	);
 }
 
-async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken) {
+async function withExtensionLoadEnv<T>(agentDir: string | undefined, fn: () => Promise<T>): Promise<T> {
+	if (!agentDir) {
+		return fn();
+	}
+
+	const previousAgentDir = process.env[ENV_AGENT_DIR];
+	process.env[ENV_AGENT_DIR] = agentDir;
+	try {
+		return await fn();
+	} finally {
+		if (previousAgentDir === undefined) {
+			delete process.env[ENV_AGENT_DIR];
+		} else {
+			process.env[ENV_AGENT_DIR] = previousAgentDir;
+		}
+	}
+}
+
+async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken, agentDir?: string) {
 	if (isCurrentCacheToken(cacheToken)) {
 		const cachedFactory = extensionCache.get(extensionPath);
 		if (cachedFactory) {
@@ -416,7 +461,7 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		...(isBunBinary ? { virtualModules: VIRTUAL_MODULES, tryNative: false } : { alias: getAliases() }),
 	});
 
-	const module = await jiti.import(extensionPath, { default: true });
+	const module = await withExtensionLoadEnv(agentDir, () => jiti.import(extensionPath, { default: true }));
 	const factory = module as ExtensionFactory;
 	if (typeof factory !== "function") {
 		return undefined;
@@ -457,11 +502,12 @@ async function loadExtension(
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
 	cacheToken?: ExtensionCacheToken,
+	agentDir?: string,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
 
 	try {
-		const factory = await loadExtensionModule(resolvedPath, cacheToken);
+		const factory = await loadExtensionModule(resolvedPath, cacheToken, agentDir);
 		time(`${extensionPath} module import`, "extensions");
 		if (!factory) {
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
@@ -469,7 +515,7 @@ async function loadExtension(
 
 		const extension = createExtension(extensionPath, resolvedPath);
 		const api = createExtensionAPI(extension, runtime, cwd, eventBus);
-		await factory(api);
+		await withExtensionLoadEnv(agentDir, () => Promise.resolve(factory(api)));
 		time(`${extensionPath} factory`, "extensions");
 
 		return { extension, error: null };
@@ -506,11 +552,13 @@ async function loadExtensionsInternal(
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
 	useCache = false,
+	agentDir?: string,
 ): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
-	const cacheToken = useCache ? useExtensionCacheCwd(cwd) : undefined;
+	const cacheToken = useCache ? useExtensionCacheCwd(cwd, agentDir) : undefined;
 	const resolvedCwd = cacheToken?.cwd ?? resolvePath(cwd);
+	const resolvedAgentDir = agentDir ? resolvePath(agentDir) : undefined;
 	const resolvedEventBus = eventBus ?? createEventBus();
 	const resolvedRuntime = runtime ?? createExtensionRuntime();
 
@@ -521,6 +569,7 @@ async function loadExtensionsInternal(
 			resolvedEventBus,
 			resolvedRuntime,
 			cacheToken,
+			resolvedAgentDir,
 		);
 
 		if (error) {
@@ -545,8 +594,9 @@ export async function loadExtensions(
 	cwd: string,
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
+	agentDir?: string,
 ): Promise<LoadExtensionsResult> {
-	return loadExtensionsInternal(paths, cwd, eventBus, runtime);
+	return loadExtensionsInternal(paths, cwd, eventBus, runtime, false, agentDir);
 }
 
 export async function loadExtensionsCached(
@@ -554,8 +604,9 @@ export async function loadExtensionsCached(
 	cwd: string,
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
+	agentDir?: string,
 ): Promise<LoadExtensionsResult> {
-	return loadExtensionsInternal(paths, cwd, eventBus, runtime, true);
+	return loadExtensionsInternal(paths, cwd, eventBus, runtime, true, agentDir);
 }
 
 interface PiManifest {
@@ -717,5 +768,5 @@ export async function discoverAndLoadExtensions(
 		addPaths([resolved]);
 	}
 
-	return loadExtensions(allPaths, resolvedCwd, eventBus);
+	return loadExtensions(allPaths, resolvedCwd, eventBus, undefined, resolvedAgentDir);
 }

@@ -165,6 +165,7 @@ export class AgentSessionRuntime {
 	}
 
 	private async teardownCurrent(reason: SessionShutdownEvent["reason"], targetSessionFile?: string): Promise<void> {
+		const services = this.services;
 		await emitSessionShutdownEvent(this.session.extensionRunner, {
 			type: "session_shutdown",
 			reason,
@@ -172,6 +173,7 @@ export class AgentSessionRuntime {
 		});
 		this.beforeSessionInvalidate?.();
 		this.session.dispose();
+		await services.dispose?.();
 	}
 
 	private apply(result: CreateAgentSessionRuntimeResult): void {
@@ -393,12 +395,14 @@ export class AgentSessionRuntime {
 	}
 
 	async dispose(): Promise<void> {
+		const services = this.services;
 		await emitSessionShutdownEvent(this.session.extensionRunner, {
 			type: "session_shutdown",
 			reason: "quit",
 		});
 		this.beforeSessionInvalidate?.();
 		this.session.dispose();
+		await services.dispose?.();
 	}
 }
 

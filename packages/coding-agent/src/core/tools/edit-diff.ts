@@ -197,6 +197,20 @@ export interface AppliedEditsResult {
 	newContent: string;
 }
 
+export interface AppliedPatchResult {
+	baseContent: string;
+	newContent: string;
+	hunksApplied: number;
+	hunks: AppliedPatchHunk[];
+}
+
+export interface AppliedPatchHunk {
+	index: number;
+	oldStartLine: number;
+	oldLineCount: number;
+	newLineCount: number;
+}
+
 /**
  * Find oldText in content, trying exact match first, then fuzzy match.
  * When fuzzy matching is used, the returned contentForReplacement is the
@@ -365,6 +379,231 @@ export function applyEditsToNormalizedContent(
 	return { baseContent, newContent };
 }
 
+function getPatchBodyLines(hunkLines: readonly string[]): { oldLines: string[]; newLines: string[] } {
+	const oldLines: string[] = [];
+	const newLines: string[] = [];
+	for (const line of hunkLines) {
+		if (line.startsWith("\\")) continue;
+		const marker = line[0];
+		const body = line.slice(1);
+		if (marker === " ") {
+			oldLines.push(body);
+			newLines.push(body);
+		} else if (marker === "-") {
+			oldLines.push(body);
+		} else if (marker === "+") {
+			newLines.push(body);
+		} else {
+			throw new Error(`Unsupported unified diff hunk line: ${line}`);
+		}
+	}
+	return { oldLines, newLines };
+}
+
+function joinPatchLines(lines: readonly string[]): string {
+	return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
+}
+
+function countPatchBodyLines(body: string): number {
+	return body === "" ? 0 : countDiffLines(body);
+}
+
+function findUniqueBody(content: string, body: string, path: string, hunkIndex: number): number {
+	if (body.length === 0) {
+		throw new Error(`Cannot apply hunk ${hunkIndex + 1} in ${path}: hunk has no old-side context.`);
+	}
+	const first = content.indexOf(body);
+	if (first === -1) {
+		throw new Error(`Could not find old-side body for hunk ${hunkIndex + 1} in ${path}.`);
+	}
+	if (content.indexOf(body, first + body.length) !== -1) {
+		throw new Error(`Old-side body for hunk ${hunkIndex + 1} in ${path} is ambiguous.`);
+	}
+	return first;
+}
+
+function isOldBodyNotFound(error: unknown): boolean {
+	return error instanceof Error && error.message.startsWith("Could not find old-side body");
+}
+
+function getTrimmedHunkLineVariants(hunkLines: readonly string[]): string[][] {
+	let leadingContext = 0;
+	while (hunkLines[leadingContext]?.startsWith(" ")) {
+		leadingContext++;
+	}
+
+	let trailingContext = 0;
+	while (
+		trailingContext < hunkLines.length - leadingContext &&
+		hunkLines[hunkLines.length - trailingContext - 1]?.startsWith(" ")
+	) {
+		trailingContext++;
+	}
+
+	const variants: string[][] = [];
+	const maxLeadingTrim = Math.min(3, leadingContext);
+	const maxTrailingTrim = Math.min(3, trailingContext);
+	for (let leadingTrim = 0; leadingTrim <= maxLeadingTrim; leadingTrim++) {
+		for (let trailingTrim = 0; trailingTrim <= maxTrailingTrim; trailingTrim++) {
+			const end = hunkLines.length - trailingTrim;
+			if (leadingTrim >= end) continue;
+			const variant = hunkLines.slice(leadingTrim, end);
+			if (variant.some((line) => line.startsWith("-"))) {
+				variants.push([...variant]);
+			}
+		}
+	}
+	return variants;
+}
+
+function applyExactPatchBody(
+	content: string,
+	oldBody: string,
+	newBody: string,
+	path: string,
+	hunkIndex: number,
+): { content: string; hunk: AppliedPatchHunk } {
+	const matchIndex = findUniqueBody(content, oldBody, path, hunkIndex);
+	const range = getReplacementLineRange(getLineSpans(content), {
+		matchIndex,
+		matchLength: oldBody.length,
+		newText: newBody,
+	});
+	return {
+		content: applyReplacements(content, [{ matchIndex, matchLength: oldBody.length, newText: newBody }]),
+		hunk: {
+			index: hunkIndex,
+			oldStartLine: range.startLine + 1,
+			oldLineCount: countPatchBodyLines(oldBody),
+			newLineCount: countPatchBodyLines(newBody),
+		},
+	};
+}
+
+function applyUniquePatchBody(
+	content: string,
+	hunkLines: readonly string[],
+	oldBody: string,
+	newBody: string,
+	path: string,
+	hunkIndex: number,
+): { content: string; hunk: AppliedPatchHunk } {
+	try {
+		return applyExactPatchBody(content, oldBody, newBody, path, hunkIndex);
+	} catch (error) {
+		if (!isOldBodyNotFound(error)) {
+			throw error;
+		}
+	}
+
+	for (const variant of getTrimmedHunkLineVariants(hunkLines).slice(1)) {
+		const { oldLines: trimmedOldLines, newLines: trimmedNewLines } = getPatchBodyLines(variant);
+		const trimmedOldBody = joinPatchLines(trimmedOldLines);
+		const trimmedNewBody = joinPatchLines(trimmedNewLines);
+		try {
+			return applyExactPatchBody(content, trimmedOldBody, trimmedNewBody, path, hunkIndex);
+		} catch (error) {
+			if (!isOldBodyNotFound(error)) {
+				throw error;
+			}
+		}
+	}
+
+	const fuzzyContent = normalizeForFuzzyMatch(content);
+	const fuzzyOldBody = normalizeForFuzzyMatch(oldBody);
+	const matchIndex = findUniqueBody(fuzzyContent, fuzzyOldBody, path, hunkIndex);
+	const fuzzyRange = getReplacementLineRange(getLineSpans(fuzzyContent), {
+		matchIndex,
+		matchLength: fuzzyOldBody.length,
+		newText: "",
+	});
+	const originalLines = splitLinesWithEndings(content);
+	let originalLineIndex = fuzzyRange.startLine;
+	let replacement = "";
+	for (const line of hunkLines) {
+		if (line.startsWith("\\")) continue;
+		const marker = line[0];
+		const body = line.slice(1);
+		if (marker === " ") {
+			replacement += originalLines[originalLineIndex] ?? `${body}\n`;
+			originalLineIndex++;
+		} else if (marker === "-") {
+			originalLineIndex++;
+		} else if (marker === "+") {
+			replacement += `${body}\n`;
+		}
+	}
+	const originalSpans = getLineSpans(content);
+	const startOffset = originalSpans[fuzzyRange.startLine]?.start;
+	const endOffset = originalSpans[fuzzyRange.endLine - 1]?.end;
+	if (startOffset === undefined || endOffset === undefined) {
+		throw new Error(`Replacement range for hunk ${hunkIndex + 1} is outside ${path}.`);
+	}
+	return {
+		content: applyReplacements(content, [
+			{ matchIndex: startOffset, matchLength: endOffset - startOffset, newText: replacement },
+		]),
+		hunk: {
+			index: hunkIndex,
+			oldStartLine: fuzzyRange.startLine + 1,
+			oldLineCount: countPatchBodyLines(oldBody),
+			newLineCount: countPatchBodyLines(newBody),
+		},
+	};
+}
+
+function parseUnifiedPatchHunks(patch: string, path: string): string[][] {
+	const lines = patch.split("\n");
+	if (lines.filter((line) => line.startsWith("--- ")).length > 1) {
+		throw new Error(`Multi-file unified diff input is not supported by single-file edit for ${path}.`);
+	}
+	const hunks: string[][] = [];
+	let currentHunk: string[] | undefined;
+	for (const line of lines) {
+		if (line.startsWith("@@")) {
+			currentHunk = [];
+			hunks.push(currentHunk);
+			continue;
+		}
+		if (!currentHunk) continue;
+		if (line.startsWith("--- ") || line.startsWith("+++ ") || line.startsWith("diff ")) {
+			currentHunk = undefined;
+			continue;
+		}
+		if (line === "" && lines[lines.length - 1] === line) continue;
+		currentHunk.push(line);
+	}
+	if (hunks.length === 0) {
+		throw new Error(`Unified diff for ${path} does not contain any hunks.`);
+	}
+	return hunks;
+}
+
+export function applyUnifiedPatchToNormalizedContent(
+	normalizedContent: string,
+	patch: string,
+	path: string,
+): AppliedPatchResult {
+	const hunks = parseUnifiedPatchHunks(patch, path);
+	let newContent = normalizedContent;
+	const appliedHunks: AppliedPatchHunk[] = [];
+	for (let index = 0; index < hunks.length; index++) {
+		const hunkLines = hunks[index] ?? [];
+		const { oldLines, newLines } = getPatchBodyLines(hunkLines);
+		const oldBody = joinPatchLines(oldLines);
+		const newBody = joinPatchLines(newLines);
+		const applied = applyUniquePatchBody(newContent, hunkLines, oldBody, newBody, path, index);
+		newContent = applied.content;
+		appliedHunks.push(applied.hunk);
+	}
+
+	if (normalizedContent === newContent) {
+		throw getNoChangeError(path, hunks.length);
+	}
+
+	return { baseContent: normalizedContent, newContent, hunksApplied: hunks.length, hunks: appliedHunks };
+}
+
 /** Generate a standard unified patch. */
 export function generateUnifiedPatch(path: string, oldContent: string, newContent: string, contextLines = 4): string {
 	return Diff.createTwoFilesPatch(path, path, oldContent, newContent, undefined, undefined, {
@@ -505,6 +744,54 @@ export function generateDiffString(
 export interface EditDiffResult {
 	diff: string;
 	firstChangedLine: number | undefined;
+}
+
+export interface ChangedRange {
+	startLine: number;
+	endLine: number;
+}
+
+function countDiffLines(value: string): number {
+	const lines = value.split("\n");
+	if (lines[lines.length - 1] === "") {
+		lines.pop();
+	}
+	return lines.length;
+}
+
+export function computeChangedRanges(oldContent: string, newContent: string): ChangedRange[] {
+	const parts = Diff.diffLines(oldContent, newContent);
+	const ranges: ChangedRange[] = [];
+	let newLineNum = 1;
+	let currentStartLine: number | undefined;
+	let currentEndLine: number | undefined;
+
+	const flush = (): void => {
+		if (currentStartLine === undefined) return;
+		ranges.push({
+			startLine: currentStartLine,
+			endLine: currentEndLine ?? currentStartLine,
+		});
+		currentStartLine = undefined;
+		currentEndLine = undefined;
+	};
+
+	for (const part of parts) {
+		const lineCount = countDiffLines(part.value);
+		if (part.added) {
+			currentStartLine ??= newLineNum;
+			currentEndLine = newLineNum + lineCount - 1;
+			newLineNum += lineCount;
+		} else if (part.removed) {
+			currentStartLine ??= newLineNum;
+		} else {
+			flush();
+			newLineNum += lineCount;
+		}
+	}
+	flush();
+
+	return ranges;
 }
 
 export interface EditDiffError {
