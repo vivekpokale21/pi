@@ -23,6 +23,11 @@ export interface LocalModelRuntimeState {
 	message?: string;
 }
 
+export interface LocalModelRuntimeLogEntry {
+	stream: "stdout" | "stderr";
+	text: string;
+}
+
 export interface LocalModelRuntimeTarget {
 	id: string;
 	path: string;
@@ -35,6 +40,7 @@ export interface LocalModelRuntimeEndpoint {
 
 export interface LocalModelRuntimeProcess {
 	onExit(listener: (code: number | null, signal: NodeJS.Signals | null) => void): () => void;
+	onOutput?(listener: (entry: LocalModelRuntimeLogEntry) => void): () => void;
 	kill(signal?: NodeJS.Signals): void;
 }
 
@@ -59,6 +65,10 @@ export interface LocalModelRuntimeManagerOptions {
 	port?: number;
 	cwd?: string;
 	extraArgs?: string[];
+	maxLogBytes?: number;
+	restartCooldownMs?: number;
+	now?: () => number;
+	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 	operations?: LocalModelRuntimeOperations;
 }
 
@@ -82,6 +92,8 @@ type StateListener = (state: LocalModelRuntimeState) => void;
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_API_KEY = "local";
 const DEFAULT_READY_TIMEOUT_MS = 120_000;
+const DEFAULT_MAX_LOG_BYTES = 2_000_000;
+const DEFAULT_RESTART_COOLDOWN_MS = 0;
 
 function envValue(name: string): string | undefined {
 	const value = process.env[name]?.trim();
@@ -164,6 +176,16 @@ function defaultStart(
 			child.on("exit", listener);
 			return () => child.off("exit", listener);
 		},
+		onOutput: (listener) => {
+			const onStdout = (chunk: Buffer) => listener({ stream: "stdout", text: chunk.toString() });
+			const onStderr = (chunk: Buffer) => listener({ stream: "stderr", text: chunk.toString() });
+			child.stdout?.on("data", onStdout);
+			child.stderr?.on("data", onStderr);
+			return () => {
+				child.stdout?.off("data", onStdout);
+				child.stderr?.off("data", onStderr);
+			};
+		},
 		kill: (signal = "SIGTERM") => {
 			child.kill(signal);
 		},
@@ -224,13 +246,21 @@ export class LocalModelRuntimeManager {
 	private readonly configuredPort: number | undefined;
 	private readonly cwd: string;
 	private readonly extraArgs: string[];
+	private readonly maxLogBytes: number;
+	private readonly restartCooldownMs: number;
+	private readonly now: () => number;
+	private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
 	private readonly operations: LocalModelRuntimeOperations;
 	private readonly listeners = new Set<StateListener>();
+	private readonly logs: LocalModelRuntimeLogEntry[] = [];
 	private state: LocalModelRuntimeState = { value: "unloaded" };
 	private process: LocalModelRuntimeProcess | undefined;
 	private processExitUnsubscribe: (() => void) | undefined;
+	private processOutputUnsubscribe: (() => void) | undefined;
 	private endpoint: LocalModelRuntimeEndpoint | undefined;
 	private readyTarget: LocalModelRuntimeTarget | undefined;
+	private restartCooldownTarget: LocalModelRuntimeTarget | undefined;
+	private restartCooldownUntil = 0;
 	private startPromise: Promise<LocalModelRuntimeEndpoint> | undefined;
 	private shuttingDown = false;
 
@@ -240,6 +270,10 @@ export class LocalModelRuntimeManager {
 		this.configuredPort = options.port ?? configuredPort();
 		this.cwd = options.cwd ?? process.cwd();
 		this.extraArgs = options.extraArgs ?? configuredExtraArgs();
+		this.maxLogBytes = options.maxLogBytes ?? DEFAULT_MAX_LOG_BYTES;
+		this.restartCooldownMs = Math.max(0, options.restartCooldownMs ?? DEFAULT_RESTART_COOLDOWN_MS);
+		this.now = options.now ?? Date.now;
+		this.sleep = options.sleep ?? sleep;
 		this.operations = options.operations ?? defaultOperations();
 	}
 
@@ -250,6 +284,19 @@ export class LocalModelRuntimeManager {
 	subscribe(listener: StateListener): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
+	}
+
+	getLogSnapshot(): LocalModelRuntimeLogEntry[] {
+		return this.logs.map((entry) => ({ ...entry }));
+	}
+
+	private appendLog(entry: LocalModelRuntimeLogEntry): void {
+		this.logs.push(entry);
+		let totalBytes = this.logs.reduce((sum, logEntry) => sum + Buffer.byteLength(logEntry.text), 0);
+		while (totalBytes > this.maxLogBytes && this.logs.length > 0) {
+			const removed = this.logs.shift();
+			totalBytes -= removed ? Buffer.byteLength(removed.text) : 0;
+		}
 	}
 
 	private setState(state: LocalModelRuntimeState): void {
@@ -271,6 +318,8 @@ export class LocalModelRuntimeManager {
 	private async stopCurrent(): Promise<void> {
 		this.processExitUnsubscribe?.();
 		this.processExitUnsubscribe = undefined;
+		this.processOutputUnsubscribe?.();
+		this.processOutputUnsubscribe = undefined;
 		if (this.process) {
 			this.shuttingDown = true;
 			this.process.kill("SIGTERM");
@@ -279,6 +328,25 @@ export class LocalModelRuntimeManager {
 		this.process = undefined;
 		this.endpoint = undefined;
 		this.readyTarget = undefined;
+	}
+
+	private async waitForRestartCooldown(target: LocalModelRuntimeTarget, signal?: AbortSignal): Promise<void> {
+		if (
+			this.restartCooldownTarget?.id !== target.id ||
+			this.restartCooldownTarget.path !== target.path ||
+			this.restartCooldownUntil <= 0
+		) {
+			return;
+		}
+		const remainingMs = this.restartCooldownUntil - this.now();
+		if (remainingMs <= 0) {
+			this.restartCooldownTarget = undefined;
+			this.restartCooldownUntil = 0;
+			return;
+		}
+		await this.sleep(remainingMs, signal);
+		this.restartCooldownTarget = undefined;
+		this.restartCooldownUntil = 0;
 	}
 
 	private buildArgs(target: LocalModelRuntimeTarget, port: number): string[] {
@@ -323,6 +391,7 @@ export class LocalModelRuntimeManager {
 			throw this.error("model_missing", `Local model does not exist: ${target.path}`, target);
 		}
 
+		await this.waitForRestartCooldown(target, signal);
 		await this.stopCurrent();
 		const port = this.configuredPort ?? (await this.operations.allocatePort(this.host));
 		const baseUrl = `http://${this.host}:${port}`;
@@ -339,10 +408,15 @@ export class LocalModelRuntimeManager {
 			throw this.error("load_failed", error instanceof Error ? error.message : String(error), target, baseUrl);
 		}
 		this.process = childProcess;
+		this.processOutputUnsubscribe = childProcess.onOutput?.((entry) => this.appendLog(entry));
 		this.processExitUnsubscribe = childProcess.onExit((code, exitSignal) => {
 			if (this.shuttingDown) return;
 			this.process = undefined;
 			this.endpoint = undefined;
+			if (this.restartCooldownMs > 0) {
+				this.restartCooldownTarget = target;
+				this.restartCooldownUntil = this.now() + this.restartCooldownMs;
+			}
 			this.setState({
 				value: "process_exited",
 				modelId: target.id,

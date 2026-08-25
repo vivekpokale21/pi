@@ -33,7 +33,11 @@ import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { getAgentDir } from "../config.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
 import { createLocalModelProvider, type LocalModelProviderRuntime } from "./local-model-catalog.ts";
-import { LocalModelRuntimeManager, type LocalModelRuntimeState } from "./local-model-runtime-manager.ts";
+import {
+	type LocalModelRuntimeLogEntry,
+	LocalModelRuntimeManager,
+	type LocalModelRuntimeState,
+} from "./local-model-runtime-manager.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
 import {
@@ -364,6 +368,10 @@ export class ModelRuntime implements Models {
 
 	subscribeLocalModelRuntime(listener: (state: LocalModelRuntimeState) => void): () => void {
 		return this.localModelRuntimeManager?.subscribe?.(listener) ?? (() => {});
+	}
+
+	getLocalModelRuntimeLogSnapshot(): LocalModelRuntimeLogEntry[] {
+		return this.localModelRuntimeManager?.getLogSnapshot?.() ?? [];
 	}
 
 	/** @internal Compatibility fallback for ModelRegistry when provider auth is unconfigured. */

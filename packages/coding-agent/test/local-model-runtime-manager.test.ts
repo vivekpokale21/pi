@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	LocalModelRuntimeError,
+	type LocalModelRuntimeLogEntry,
 	LocalModelRuntimeManager,
 	type LocalModelRuntimeProcess,
 	type LocalModelRuntimeStateValue,
@@ -19,12 +20,21 @@ class FakeProcess implements LocalModelRuntimeProcess {
 		return () => this.emitter.off("exit", listener);
 	}
 
+	onOutput(listener: (entry: LocalModelRuntimeLogEntry) => void): () => void {
+		this.emitter.on("output", listener);
+		return () => this.emitter.off("output", listener);
+	}
+
 	kill(): void {
 		this.killCalls++;
 	}
 
 	exit(code: number | null = 1, signal: NodeJS.Signals | null = null): void {
 		this.emitter.emit("exit", code, signal);
+	}
+
+	output(entry: LocalModelRuntimeLogEntry): void {
+		this.emitter.emit("output", entry);
 	}
 }
 
@@ -164,6 +174,31 @@ describe("LocalModelRuntimeManager", () => {
 		expect(manager.getState()).toMatchObject({ value: "process_exited", modelId: "model" });
 	});
 
+	it("captures bounded llama-server output for benchmark artifacts", async () => {
+		const modelPath = tempFile("model.gguf");
+		const process = new FakeProcess();
+		const manager = new LocalModelRuntimeManager({
+			maxLogBytes: 130,
+			operations: {
+				executableExists: async () => true,
+				modelExists: async () => true,
+				allocatePort: async () => 49160,
+				start: () => process,
+				waitUntilReady: async () => {},
+			},
+		});
+
+		await manager.ensureReady({ id: "model", path: modelPath });
+		process.output({ stream: "stdout", text: "model load started\n" });
+		process.output({ stream: "stderr", text: "llama_print_timings: prompt eval time = 10.00 ms / 5 tokens\n" });
+		process.output({ stream: "stderr", text: "llama_print_timings: eval time = 20.00 ms / 10 tokens\n" });
+
+		expect(manager.getLogSnapshot()).toEqual([
+			{ stream: "stderr", text: "llama_print_timings: prompt eval time = 10.00 ms / 5 tokens\n" },
+			{ stream: "stderr", text: "llama_print_timings: eval time = 20.00 ms / 10 tokens\n" },
+		]);
+	});
+
 	it("restarts after an unexpected process exit on the next request", async () => {
 		const modelPath = tempFile("model.gguf");
 		const processes: FakeProcess[] = [];
@@ -185,6 +220,42 @@ describe("LocalModelRuntimeManager", () => {
 		processes[0]?.exit(9);
 		await manager.ensureReady({ id: "model", path: modelPath });
 
+		expect(processes).toHaveLength(2);
+		expect(manager.getState()).toMatchObject({ value: "ready", modelId: "model" });
+	});
+
+	it("waits for the configured crash cooldown before restarting after an unexpected exit", async () => {
+		const modelPath = tempFile("model.gguf");
+		let now = 1_000;
+		const slept: number[] = [];
+		const processes: FakeProcess[] = [];
+		const manager = new LocalModelRuntimeManager({
+			restartCooldownMs: 5_000,
+			now: () => now,
+			sleep: async (ms) => {
+				slept.push(ms);
+				now += ms;
+			},
+			operations: {
+				executableExists: async () => true,
+				modelExists: async () => true,
+				allocatePort: async () => 49163,
+				start: () => {
+					const process = new FakeProcess();
+					processes.push(process);
+					return process;
+				},
+				waitUntilReady: async () => {},
+			},
+		});
+
+		await manager.ensureReady({ id: "model", path: modelPath });
+		now += 1_000;
+		processes[0]?.exit(9);
+		now += 2_000;
+		await manager.ensureReady({ id: "model", path: modelPath });
+
+		expect(slept).toEqual([3_000]);
 		expect(processes).toHaveLength(2);
 		expect(manager.getState()).toMatchObject({ value: "ready", modelId: "model" });
 	});

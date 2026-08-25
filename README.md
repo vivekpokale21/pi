@@ -18,21 +18,19 @@ This is the home of the Pi agent harness project including our self extensible c
 * **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
 * **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
 
-## Local Qwen 3.6 Harness
+## Native Local Qwen Runtime
 
-This fork keeps the stock Pi package names and project identity, but adds a local harness under [`scripts/local-qwen36`](scripts/local-qwen36) for testing Pi against a fixed llama.cpp-served Qwen 3.6 setup.
+This fork keeps the stock Pi package names and project identity, and carries native local GGUF support in `packages/coding-agent`.
 
-The current target is Qwen3.6-35B-A3B running through llama.cpp's OpenAI-compatible server, using the `Qwen3.6-35B-A3B-IQ4_XS-4.15bpw.gguf` profile with a 131k context window. The local performance target is roughly 550 tokens/s prompt processing and 25 tokens/s token generation on the current ByteShape GPU-5 setup.
+The current target is Qwen3.6-35B-A3B running through llama.cpp's OpenAI-compatible server, using local GGUF discovery, native llama.cpp lifecycle management, native read/edit/search tools, and the native benchmark runner.
 
-Compared with stock Pi, the local harness adds:
+Compared with stock Pi, this fork adds:
 
-- a fixed Qwen 3.6 llama.cpp launcher with dry-run validation;
-- planner/executor profile switching on one Pi `Agent`, including different sampler and thinking settings;
-- executor-only deterministic `apply_diff` with dry-run patch validation;
-- crash-loop backoff for the local llama.cpp server;
-- hierarchical working/persistent memory blocks for repeated local sessions;
-- read-only `lsp_symbols` and `semantic_search` tools for planner and executor context;
-- optional local embeddings, HyDE, rerank, and Qdrant-compatible vector search paths for retrieval experiments.
+- local GGUF discovery through the native `local` provider;
+- native llama.cpp startup, model loading, and runtime state events;
+- native Qwen request defaults for detected local Qwen models;
+- native read receipts, verified editing, semantic search, and benchmark paths;
+- optional local CodeRankEmbed-backed semantic indexing through shared workspace services.
 
 To learn more about Pi:
 

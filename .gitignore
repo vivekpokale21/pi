@@ -44,6 +44,7 @@ todo.md
 plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
+.pi/handoffs/
 collect.sh
 
 # Local benchmark harnesses and experiments

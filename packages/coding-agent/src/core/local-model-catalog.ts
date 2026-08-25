@@ -16,6 +16,7 @@ import { stream, streamSimple } from "@earendil-works/pi-ai/compat";
 import { normalizePath } from "../utils/paths.ts";
 import {
 	type LocalModelRuntimeEndpoint,
+	type LocalModelRuntimeLogEntry,
 	LocalModelRuntimeManager,
 	type LocalModelRuntimeState,
 	type LocalModelRuntimeTarget,
@@ -55,6 +56,7 @@ export interface LocalModelProviderRuntime {
 	ensureReady(target: LocalModelRuntimeTarget, signal?: AbortSignal): Promise<LocalModelRuntimeEndpoint>;
 	inferenceBaseUrl(endpoint: LocalModelRuntimeEndpoint): string;
 	subscribe?(listener: (state: LocalModelRuntimeState) => void): () => void;
+	getLogSnapshot?(): LocalModelRuntimeLogEntry[];
 	shutdown?(): Promise<void>;
 }
 

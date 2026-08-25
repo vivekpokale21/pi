@@ -13,6 +13,7 @@ import {
 	createAgentSessionFromServices,
 	createAgentSessionServices,
 } from "./agent-session-services.ts";
+import type { LocalModelRuntimeLogEntry } from "./local-model-runtime-manager.ts";
 import { resolveCliModel } from "./model-resolver.ts";
 import { SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
@@ -87,6 +88,9 @@ export interface NativeBenchmarkTaskResult {
 	};
 	workspace?: NativeBenchmarkWorkspace;
 	capabilities: NativeBenchmarkCapabilityDeclaration;
+	runtimeLogs: {
+		localModel: LocalModelRuntimeLogEntry[];
+	};
 	assistantText: string;
 	finalAssistantTextLength: number;
 	pass: boolean;
@@ -202,6 +206,11 @@ export type NativeBenchmarkJsonlTraceEntry =
 			type: "capabilities";
 			taskId: string;
 			capabilities: NativeBenchmarkCapabilityDeclaration;
+	  }
+	| {
+			type: "runtime_logs";
+			taskId: string;
+			runtimeLogs: NativeBenchmarkTaskResult["runtimeLogs"];
 	  }
 	| {
 			type: "event";
@@ -1069,6 +1078,9 @@ export async function runNativeBenchmarkTask(options: NativeBenchmarkTaskOptions
 				session,
 				extensionErrors: result.extensionsResult.errors,
 			}),
+			runtimeLogs: {
+				localModel: services.modelRuntime.getLocalModelRuntimeLogSnapshot(),
+			},
 			assistantText,
 			finalAssistantTextLength: assistantText.length,
 			pass: evaluation.pass,
@@ -1132,6 +1144,11 @@ export function nativeBenchmarkJsonlTraceEntries(result: NativeBenchmarkTaskResu
 			taskId: result.task.id,
 			capabilities: result.capabilities,
 		},
+		{
+			type: "runtime_logs",
+			taskId: result.task.id,
+			runtimeLogs: result.runtimeLogs,
+		},
 		...result.events.map(
 			(event): NativeBenchmarkJsonlTraceEntry => ({ type: "event", taskId: result.task.id, event }),
 		),
@@ -1183,6 +1200,12 @@ export function nativeBenchmarkMarkdownReport(result: NativeBenchmarkTaskResult)
 					})
 					.join("\n")
 			: "- none";
+	const localRuntimeLogs =
+		result.runtimeLogs.localModel.length > 0
+			? result.runtimeLogs.localModel
+					.map((entry) => `- ${entry.stream}: ${truncateTraceText(entry.text, 400).replace(/\n/g, "\\n")}`)
+					.join("\n")
+			: "- none";
 
 	return `# Native Benchmark Report
 
@@ -1207,6 +1230,9 @@ Metrics:
 
 Validation:
 ${validation}
+
+Local runtime logs:
+${localRuntimeLogs}
 
 Extension diagnostics:
 ${diagnostics}

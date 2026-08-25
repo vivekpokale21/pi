@@ -26,6 +26,22 @@ describe("buildSystemPrompt", () => {
 		});
 	});
 
+	describe("custom prompt", () => {
+		test("keeps native context handoff guidance with a custom base prompt", () => {
+			const prompt = buildSystemPrompt({
+				customPrompt: "Custom base.",
+				selectedTools: [],
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).toContain("Custom base.");
+			expect(prompt).toContain("Context handoff protocol");
+			expect(prompt).toContain(".pi/handoffs/");
+		});
+	});
+
 	describe("default tools", () => {
 		test("includes all default tools when snippets are provided", () => {
 			const prompt = buildSystemPrompt({
@@ -57,6 +73,19 @@ describe("buildSystemPrompt", () => {
 				"- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory",
 			);
 			expect(prompt).toContain("environment variables (docs/environment-variables.md)");
+		});
+
+		test("includes native context handoff guidance", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).toContain("Context handoff protocol");
+			expect(prompt).toContain(".pi/handoffs/");
+			expect(prompt).toContain("planner");
+			expect(prompt).toContain("executor");
 		});
 	});
 

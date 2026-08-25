@@ -289,6 +289,74 @@ describe("native benchmark capability declaration", () => {
 		expect(result.metrics.toolCalls).toBe(0);
 	});
 
+	it("snapshots native local runtime logs into benchmark task results before service disposal", async () => {
+		const faux = registerFauxProvider();
+		cleanups.push(() => faux.unregister());
+		faux.setResponses([fauxAssistantMessage("runtime log ok")]);
+
+		const authStorage = AuthStorage.inMemory();
+		await authStorage.modify(faux.getModel().provider, async () => ({ type: "api_key", key: "faux-key" }));
+		const modelRuntime = await ModelRuntime.create({
+			credentials: authStorage,
+			modelsPath: join(tempDir, "models.json"),
+			localModelRuntimeManager: {
+				ensureReady: async () => ({ baseUrl: "http://127.0.0.1:8123", apiKey: "local" }),
+				inferenceBaseUrl: (endpoint) => `${endpoint.baseUrl}/v1`,
+				shutdown: async () => {},
+				getLogSnapshot: () => [
+					{
+						stream: "stderr",
+						text: "llama_print_timings: prompt eval time = 10.00 ms / 5 tokens\n",
+					},
+				],
+			},
+		});
+		cleanups.push(() => modelRuntime.dispose());
+		const model = faux.getModel();
+		modelRuntime.registerProvider(model.provider, {
+			baseUrl: model.baseUrl,
+			api: model.api,
+			models: [
+				{
+					id: model.id,
+					name: model.name,
+					api: model.api,
+					reasoning: model.reasoning,
+					input: model.input,
+					cost: model.cost,
+					contextWindow: model.contextWindow,
+					maxTokens: model.maxTokens,
+					baseUrl: model.baseUrl,
+				},
+			],
+		});
+
+		const result = await runNativeBenchmarkTask({
+			cwd: tempDir,
+			agentDir,
+			modelRuntime,
+			model,
+			settingsManager: SettingsManager.create(tempDir, agentDir),
+			task: {
+				id: "runtime-log",
+				prompt: "Return runtime log ok.",
+				expectedAssistantTextIncludes: "runtime log ok",
+			},
+			resourceLoaderOptions: {
+				noSkills: true,
+				noPromptTemplates: true,
+				noThemes: true,
+			},
+		});
+
+		expect(result.runtimeLogs.localModel).toEqual([
+			{
+				stream: "stderr",
+				text: "llama_print_timings: prompt eval time = 10.00 ms / 5 tokens\n",
+			},
+		]);
+	});
+
 	it("counts native semantic_search calls as retrieval metrics", async () => {
 		writeFileSync(join(tempDir, "needle.ts"), "export const benchmarkNeedle = true;\n");
 		const faux = registerFauxProvider();
@@ -457,6 +525,9 @@ describe("native benchmark capability declaration", () => {
 				extensionDiagnostics: [],
 			},
 			assistantText: "trace output",
+			runtimeLogs: {
+				localModel: [],
+			},
 			finalAssistantTextLength: "trace output".length,
 			pass: true,
 			validation: [],
@@ -484,6 +555,13 @@ describe("native benchmark capability declaration", () => {
 					webAccess: "unavailable",
 					activeNativeTools: ["read", "semantic_search"],
 				}),
+			},
+			{
+				type: "runtime_logs",
+				taskId: "trace-task",
+				runtimeLogs: {
+					localModel: [],
+				},
 			},
 			{
 				type: "event",
@@ -544,6 +622,14 @@ describe("native benchmark capability declaration", () => {
 				extensionDiagnostics: [{ type: "info", message: "diagnostic" }],
 			},
 			assistantText: "report output",
+			runtimeLogs: {
+				localModel: [
+					{
+						stream: "stderr",
+						text: "llama_print_timings: eval time = 20.00 ms\n",
+					},
+				],
+			},
 			finalAssistantTextLength: "report output".length,
 			pass: true,
 			validation: [],
@@ -583,6 +669,9 @@ Metrics:
 
 Validation:
 - none
+
+Local runtime logs:
+- stderr: llama_print_timings: eval time = 20.00 ms\\n
 
 Extension diagnostics:
 - info: diagnostic
@@ -1082,6 +1171,9 @@ Extension diagnostics:
 						extensionDiagnostics: [],
 					},
 					assistantText: "first output",
+					runtimeLogs: {
+						localModel: [],
+					},
 					finalAssistantTextLength: "first output".length,
 					pass: false,
 					failureReason: "Validation command failed: false",
@@ -1195,6 +1287,9 @@ Extension diagnostics:
 									extensionDiagnostics: [],
 								},
 								assistantText: "app/api.py get_day etag",
+								runtimeLogs: {
+									localModel: [],
+								},
 								finalAssistantTextLength: "app/api.py get_day etag".length,
 								pass: true,
 								validation: [],

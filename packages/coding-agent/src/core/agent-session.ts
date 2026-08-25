@@ -62,6 +62,7 @@ import {
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.ts";
+import { buildContextBudgetReminder, type ContextBudgetBand, getContextBudgetReminderBand } from "./context-handoff.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -196,6 +197,16 @@ function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<str
 		: undefined;
 }
 
+function contextBudgetBandSeverity(band: ContextBudgetBand): number {
+	if (band === "tighten_scope") {
+		return 1;
+	}
+	if (band === "prepare_handoff") {
+		return 2;
+	}
+	return 3;
+}
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -209,7 +220,7 @@ export interface AgentSessionConfig {
 	customTools?: ToolDefinition[];
 	/** Canonical model/auth runtime used by coding-agent internals. */
 	modelRuntime: ModelRuntime;
-	/** Initial active built-in tool names. Default: [read, bash, edit, write, semantic_search] */
+	/** Initial active built-in tool names. Default: [read, bash, edit, write, semantic_search, handoff, handoff_status] */
 	initialActiveToolNames?: string[];
 	semanticIndex?: WorkspaceSemanticIndex;
 	ownsSemanticIndex?: boolean;
@@ -379,6 +390,7 @@ export class AgentSession {
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 	private _systemPromptOverride?: string;
+	private _lastContextBudgetReminderBand?: ContextBudgetBand;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -405,6 +417,7 @@ export class AgentSession {
 			this._emit({ type: "local_model_runtime_state", state });
 		});
 		this._installAgentToolHooks();
+		this._installContextHandoffConversion();
 		this._installAgentNextTurnRefresh();
 
 		this._buildRuntime({
@@ -550,6 +563,25 @@ export class AgentSession {
 				model: this.agent.state.model,
 				thinkingLevel: this.agent.state.thinkingLevel,
 			};
+		};
+	}
+
+	private _installContextHandoffConversion(): void {
+		const previousConvertToLlm = this.agent.convertToLlm;
+		this.agent.convertToLlm = async (messages) => {
+			const expandedMessages: AgentMessage[] = [];
+			for (const message of messages) {
+				if (message.role === "custom" && message.customType === "context_budget_reminder") {
+					expandedMessages.push({
+						role: "user",
+						content: message.content,
+						timestamp: message.timestamp,
+					});
+				} else {
+					expandedMessages.push(message);
+				}
+			}
+			return await previousConvertToLlm(expandedMessages);
 		};
 	}
 
@@ -1088,6 +1120,47 @@ export class AgentSession {
 		}
 	}
 
+	private _buildContextBudgetReminderMessage(): CustomMessage | undefined {
+		const usage = this.getContextUsage();
+		if (!usage) {
+			this._lastContextBudgetReminderBand = undefined;
+			return undefined;
+		}
+
+		const band = getContextBudgetReminderBand({
+			tokens: usage.tokens,
+			contextWindow: usage.contextWindow,
+		});
+		if (!band) {
+			this._lastContextBudgetReminderBand = undefined;
+			return undefined;
+		}
+
+		if (
+			this._lastContextBudgetReminderBand &&
+			contextBudgetBandSeverity(band) <= contextBudgetBandSeverity(this._lastContextBudgetReminderBand)
+		) {
+			return undefined;
+		}
+
+		const reminder = buildContextBudgetReminder({
+			tokens: usage.tokens,
+			contextWindow: usage.contextWindow,
+		});
+		if (!reminder) {
+			return undefined;
+		}
+
+		this._lastContextBudgetReminderBand = band;
+		return {
+			role: "custom",
+			customType: "context_budget_reminder",
+			content: [{ type: "text", text: reminder }],
+			display: false,
+			timestamp: Date.now(),
+		};
+	}
+
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
@@ -1219,6 +1292,11 @@ export class AgentSession {
 
 			// Build messages array (custom message if any, then user message)
 			messages = [];
+
+			const contextBudgetReminder = this._buildContextBudgetReminderMessage();
+			if (contextBudgetReminder) {
+				messages.push(contextBudgetReminder);
+			}
 
 			// Add user message
 			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
@@ -2611,7 +2689,7 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write", "semantic_search"];
+			: ["read", "bash", "edit", "write", "semantic_search", "handoff", "handoff_status"];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
