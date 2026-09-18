@@ -1048,11 +1048,13 @@ describe("agentLoop with AgentMessage", () => {
 			tools: [tool],
 		};
 		let convertedSecondTurnSystemPrompt = "";
+		let prepareCalls = 0;
 		let prepared = false;
 		const config: AgentLoopConfig = {
 			model: createModel(),
 			convertToLlm: identityConverter,
 			prepareNextTurn: async ({ context: currentContext }) => {
+				prepareCalls++;
 				if (prepared) return undefined;
 				prepared = true;
 				return {
@@ -1098,6 +1100,7 @@ describe("agentLoop with AgentMessage", () => {
 		}
 
 		expect(llmCalls).toBe(2);
+		expect(prepareCalls).toBe(1);
 		expect(convertedSecondTurnSystemPrompt).toBe("second prompt");
 	});
 
@@ -1126,6 +1129,7 @@ describe("agentLoop with AgentMessage", () => {
 
 		let steeringPolls = 0;
 		let followUpPolls = 0;
+		let prepareCalls = 0;
 		let callbackToolResultIds: string[] = [];
 		let callbackContextRoles: string[] = [];
 		const config: AgentLoopConfig = {
@@ -1138,6 +1142,10 @@ describe("agentLoop with AgentMessage", () => {
 			getFollowUpMessages: async () => {
 				followUpPolls++;
 				return [createUserMessage("follow up should stay queued")];
+			},
+			prepareNextTurn: async () => {
+				prepareCalls++;
+				return undefined;
 			},
 			shouldStopAfterTurn: async ({ message, toolResults, context }) => {
 				expect(message.role).toBe("assistant");
@@ -1179,6 +1187,7 @@ describe("agentLoop with AgentMessage", () => {
 		expect(executed).toEqual(["hello"]);
 		expect(steeringPolls).toBe(1);
 		expect(followUpPolls).toBe(0);
+		expect(prepareCalls).toBe(0);
 		expect(callbackToolResultIds).toEqual(["tool-1"]);
 		expect(callbackContextRoles).toEqual(["user", "assistant", "toolResult"]);
 		expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "toolResult"]);

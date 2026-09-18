@@ -10,6 +10,9 @@
 
 ### Fixed
 
+- Fixed oversized tool results reaching the model before automatic compaction in the same agent run ([#6879](https://github.com/earendil-works/pi/issues/6879)).
+- Fixed signal-terminated shell commands and custom shell operations without exit codes being reported as successful ([#9577](https://github.com/earendil-works/pi/issues/9577)).
+- Capped agent-level retry backoff at `retry.maxAgentDelayMs` (60 seconds by default) ([#8826](https://github.com/earendil-works/pi/issues/8826)).
 - Fixed compaction and branch-summary requests to use fresh routing session IDs with prompt caching disabled where supported.
 - Fixed explicit self-updates when `PI_SKIP_VERSION_CHECK` is set ([#6977](https://github.com/earendil-works/pi/issues/6977)).
 

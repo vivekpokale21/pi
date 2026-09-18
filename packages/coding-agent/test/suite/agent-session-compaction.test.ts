@@ -1,9 +1,12 @@
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
+	fauxToolCall,
 	type Model,
 } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateTokens } from "../../src/core/compaction/index.ts";
 import { createHarness, type Harness } from "./harness.ts";
@@ -454,6 +457,65 @@ describe("AgentSession compaction characterization", () => {
 		await sessionInternals._checkCompaction(errorAssistant);
 
 		expect(runAutoCompactionSpy).not.toHaveBeenCalled();
+	});
+
+	it("compacts after a tool result before the next assistant request in the same run", async () => {
+		const toolResult = `large-tool-result:${"x".repeat(6800)}`;
+		const largeTool: AgentTool = {
+			name: "large_result",
+			label: "Large result",
+			description: "Returns enough content to cross the compaction threshold",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: toolResult }], details: {} }),
+		};
+		const order: string[] = [];
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 2600, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, reserveTokens: 400, keepRecentTokens: 1750 } },
+			tools: [largeTool],
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", (event) => {
+						order.push("compaction");
+						return {
+							compaction: {
+								summary: "compacted history",
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+								details: {},
+							},
+						};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		let resumedRequest = "";
+		harness.setResponses([
+			fauxAssistantMessage(`old-history:${"a".repeat(800)}`),
+			fauxAssistantMessage(`recent-history:${"b".repeat(800)}`),
+			fauxAssistantMessage(fauxToolCall("large_result", {}), { stopReason: "toolUse" }),
+			(context) => {
+				order.push("provider");
+				resumedRequest = JSON.stringify(context.messages);
+				return fauxAssistantMessage("finished after compaction");
+			},
+		]);
+
+		await harness.session.prompt("seed old history");
+		await harness.session.prompt("seed recent history");
+		const agentStartsBefore = harness.eventsOfType("agent_start").length;
+		await harness.session.prompt("run the large tool");
+
+		expect(order).toEqual(["compaction", "provider"]);
+		expect(harness.eventsOfType("agent_start")).toHaveLength(agentStartsBefore + 1);
+		expect(harness.eventsOfType("compaction_start").at(-1)).toEqual({
+			type: "compaction_start",
+			reason: "threshold",
+		});
+		expect(resumedRequest).toContain("compacted history");
+		expect(resumedRequest).toContain("large-tool-result");
+		expect(harness.session.getLastAssistantText()).toBe("finished after compaction");
 	});
 
 	it("does not trigger threshold compaction below the threshold or when disabled", async () => {

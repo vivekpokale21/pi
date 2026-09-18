@@ -12,6 +12,7 @@
 
 ### Changed
 
+- Run next-turn preparation only when the agent loop will make another provider request ([#6879](https://github.com/earendil-works/pi/issues/6879)).
 - Aligned harness tool path handling, edit serialization, shell output capture, explicit non-inherited environments, and cross-platform process cleanup with coding-agent behavior.
 
 ## [0.81.1] - 2026-07-21

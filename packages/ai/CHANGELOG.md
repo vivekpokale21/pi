@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Fixed quadratic CPU usage when draining large buffered `EventStream` queues ([#9055](https://github.com/earendil-works/pi/issues/9055)).
+- Capped agent-level retry delays at 60 seconds by default, with an optional policy override ([#8826](https://github.com/earendil-works/pi/issues/8826)).
 - Fixed OpenAI and Anthropic provider retry waits to honor abort signals and configured delay limits ([#6911](https://github.com/earendil-works/pi/issues/6911)).
 - Fixed OpenRouter Anthropic cache breakpoints to advance through tool results and enabled cache control for `~anthropic/*-latest` aliases ([#6941](https://github.com/earendil-works/pi/pull/6941) by [@mteam88](https://github.com/mteam88)).
 

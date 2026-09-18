@@ -32,6 +32,8 @@ Auto-compaction triggers when:
 contextTokens > contextWindow - reserveTokens
 ```
 
+The threshold is checked before every additional provider request in an active tool loop, so a large tool result can be compacted before it is sent back to the model.
+
 By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). This leaves room for the LLM's response.
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
