@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
+import { closeSync, mkdirSync, openSync } from "node:fs";
 import { access } from "node:fs/promises";
 import { createServer } from "node:net";
-import { delimiter, isAbsolute, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { llamaInferenceUrl } from "../extensions/llama/client.ts";
 
 export type LocalModelRuntimeStateValue =
@@ -39,6 +41,7 @@ export interface LocalModelRuntimeEndpoint {
 }
 
 export interface LocalModelRuntimeProcess {
+	pid?: number;
 	onExit(listener: (code: number | null, signal: NodeJS.Signals | null) => void): () => void;
 	onOutput?(listener: (entry: LocalModelRuntimeLogEntry) => void): () => void;
 	kill(signal?: NodeJS.Signals): void;
@@ -49,6 +52,8 @@ export interface LocalModelRuntimeStartOptions {
 	host: string;
 	port: number;
 	env: NodeJS.ProcessEnv;
+	retainAfterParentExit?: boolean;
+	logPath?: string;
 }
 
 export interface LocalModelRuntimeOperations {
@@ -56,7 +61,7 @@ export interface LocalModelRuntimeOperations {
 	modelExists(path: string): Promise<boolean>;
 	allocatePort(host: string): Promise<number>;
 	start(command: string, args: string[], options: LocalModelRuntimeStartOptions): LocalModelRuntimeProcess;
-	waitUntilReady(baseUrl: string, signal?: AbortSignal): Promise<void>;
+	waitUntilReady(baseUrl: string, signal?: AbortSignal, readyTimeoutMs?: number): Promise<void>;
 }
 
 export interface LocalModelRuntimeManagerOptions {
@@ -67,6 +72,9 @@ export interface LocalModelRuntimeManagerOptions {
 	extraArgs?: string[];
 	maxLogBytes?: number;
 	restartCooldownMs?: number;
+	readyTimeoutMs?: number;
+	retainAfterParentExit?: boolean;
+	logPath?: string;
 	now?: () => number;
 	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 	operations?: LocalModelRuntimeOperations;
@@ -94,6 +102,9 @@ const DEFAULT_API_KEY = "local";
 const DEFAULT_READY_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_LOG_BYTES = 2_000_000;
 const DEFAULT_RESTART_COOLDOWN_MS = 0;
+const QWEN_SHARP_CHAT_TEMPLATE_FILE = fileURLToPath(
+	new URL("./chat-templates/qwen-sharp-chat-template.jinja", import.meta.url),
+);
 
 function envValue(name: string): string | undefined {
 	const value = process.env[name]?.trim();
@@ -112,9 +123,28 @@ function configuredPort(): number | undefined {
 	return port;
 }
 
+function configuredReadyTimeoutMs(): number | undefined {
+	const value = envValue("PI_LOCAL_LLAMA_READY_TIMEOUT_MS");
+	if (!value) return undefined;
+	const timeoutMs = Number(value);
+	return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : undefined;
+}
+
 function configuredExtraArgs(): string[] {
 	const value = envValue("PI_LOCAL_LLAMA_ARGS");
 	return value ? value.split(/\s+/u).filter((entry) => entry.length > 0) : [];
+}
+
+function isQwenCompatibleTarget(target: LocalModelRuntimeTarget): boolean {
+	return /\bqwen\b|qwen\d|qwen[-_.]|kat[-_.]?coder/iu.test(`${target.id} ${target.path}`);
+}
+
+function hasArg(args: readonly string[], name: string): boolean {
+	return args.includes(name);
+}
+
+function configuredLogPath(): string | undefined {
+	return envValue("PI_LOCAL_LLAMA_LOG_PATH");
 }
 
 function commandCandidates(command: string): string[] {
@@ -166,17 +196,31 @@ function defaultStart(
 	args: string[],
 	options: LocalModelRuntimeStartOptions,
 ): LocalModelRuntimeProcess {
-	const child = spawn(command, args, {
-		cwd: options.cwd,
-		env: options.env,
-		stdio: ["ignore", "pipe", "pipe"],
-	});
+	const retainedLogFd =
+		options.retainAfterParentExit === true && options.logPath ? openRetainedRuntimeLog(options.logPath) : undefined;
+	let child!: ReturnType<typeof spawn>;
+	try {
+		child = spawn(command, args, {
+			cwd: options.cwd,
+			env: options.env,
+			detached: options.retainAfterParentExit === true,
+			stdio:
+				options.retainAfterParentExit === true
+					? ["ignore", retainedLogFd ?? "ignore", retainedLogFd ?? "ignore"]
+					: ["ignore", "pipe", "pipe"],
+		});
+	} finally {
+		if (retainedLogFd !== undefined) closeSync(retainedLogFd);
+	}
+	if (options.retainAfterParentExit === true) child.unref();
 	return {
+		pid: child.pid,
 		onExit: (listener) => {
 			child.on("exit", listener);
 			return () => child.off("exit", listener);
 		},
 		onOutput: (listener) => {
+			if (options.retainAfterParentExit === true) return () => {};
 			const onStdout = (chunk: Buffer) => listener({ stream: "stdout", text: chunk.toString() });
 			const onStderr = (chunk: Buffer) => listener({ stream: "stderr", text: chunk.toString() });
 			child.stdout?.on("data", onStdout);
@@ -190,6 +234,11 @@ function defaultStart(
 			child.kill(signal);
 		},
 	};
+}
+
+function openRetainedRuntimeLog(logPath: string): number {
+	mkdirSync(dirname(logPath), { recursive: true });
+	return openSync(logPath, "a", 0o600);
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -210,8 +259,12 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
-async function defaultWaitUntilReady(baseUrl: string, signal?: AbortSignal): Promise<void> {
-	const deadline = Date.now() + DEFAULT_READY_TIMEOUT_MS;
+async function defaultWaitUntilReady(
+	baseUrl: string,
+	signal?: AbortSignal,
+	readyTimeoutMs = DEFAULT_READY_TIMEOUT_MS,
+): Promise<void> {
+	const deadline = Date.now() + readyTimeoutMs;
 	let lastError: unknown;
 	while (Date.now() < deadline) {
 		if (signal?.aborted) throw signal.reason ?? new Error("Cancelled");
@@ -248,6 +301,9 @@ export class LocalModelRuntimeManager {
 	private readonly extraArgs: string[];
 	private readonly maxLogBytes: number;
 	private readonly restartCooldownMs: number;
+	private readonly readyTimeoutMs: number;
+	private readonly retainAfterParentExit: boolean;
+	private readonly logPath: string | undefined;
 	private readonly now: () => number;
 	private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
 	private readonly operations: LocalModelRuntimeOperations;
@@ -272,6 +328,12 @@ export class LocalModelRuntimeManager {
 		this.extraArgs = options.extraArgs ?? configuredExtraArgs();
 		this.maxLogBytes = options.maxLogBytes ?? DEFAULT_MAX_LOG_BYTES;
 		this.restartCooldownMs = Math.max(0, options.restartCooldownMs ?? DEFAULT_RESTART_COOLDOWN_MS);
+		this.readyTimeoutMs = Math.max(
+			1,
+			options.readyTimeoutMs ?? configuredReadyTimeoutMs() ?? DEFAULT_READY_TIMEOUT_MS,
+		);
+		this.retainAfterParentExit = options.retainAfterParentExit === true;
+		this.logPath = options.logPath ?? configuredLogPath();
 		this.now = options.now ?? Date.now;
 		this.sleep = options.sleep ?? sleep;
 		this.operations = options.operations ?? defaultOperations();
@@ -288,6 +350,10 @@ export class LocalModelRuntimeManager {
 
 	getLogSnapshot(): LocalModelRuntimeLogEntry[] {
 		return this.logs.map((entry) => ({ ...entry }));
+	}
+
+	getProcessId(): number | undefined {
+		return this.process?.pid;
 	}
 
 	private appendLog(entry: LocalModelRuntimeLogEntry): void {
@@ -350,6 +416,16 @@ export class LocalModelRuntimeManager {
 	}
 
 	private buildArgs(target: LocalModelRuntimeTarget, port: number): string[] {
+		const qwenChatTemplateArgs =
+			isQwenCompatibleTarget(target) &&
+			!hasArg(this.extraArgs, "--chat-template-file") &&
+			!hasArg(this.extraArgs, "--chat-template")
+				? ["--chat-template-file", QWEN_SHARP_CHAT_TEMPLATE_FILE]
+				: [];
+		const qwenReasoningFormatArgs =
+			isQwenCompatibleTarget(target) && !hasArg(this.extraArgs, "--reasoning-format")
+				? ["--reasoning-format", "deepseek"]
+				: [];
 		return [
 			"--host",
 			this.host,
@@ -358,6 +434,8 @@ export class LocalModelRuntimeManager {
 			"-m",
 			target.path,
 			"--jinja",
+			...qwenChatTemplateArgs,
+			...qwenReasoningFormatArgs,
 			"--no-mmproj",
 			...this.extraArgs,
 		];
@@ -403,6 +481,8 @@ export class LocalModelRuntimeManager {
 				host: this.host,
 				port,
 				env: process.env,
+				retainAfterParentExit: this.retainAfterParentExit,
+				logPath: this.logPath,
 			});
 		} catch (error) {
 			throw this.error("load_failed", error instanceof Error ? error.message : String(error), target, baseUrl);
@@ -430,7 +510,7 @@ export class LocalModelRuntimeManager {
 
 		this.setState({ value: "loading_model", modelId: target.id, modelPath: target.path, baseUrl });
 		try {
-			await this.operations.waitUntilReady(baseUrl, signal);
+			await this.operations.waitUntilReady(baseUrl, signal, this.readyTimeoutMs);
 		} catch (error) {
 			await this.stopCurrent();
 			throw this.error("load_failed", error instanceof Error ? error.message : String(error), target, baseUrl);

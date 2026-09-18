@@ -40,6 +40,7 @@ class FakeProcess implements LocalModelRuntimeProcess {
 
 describe("LocalModelRuntimeManager", () => {
 	const originalServerBin = process.env.LLAMA_CPP_SERVER_BIN;
+	const originalLogPath = process.env.PI_LOCAL_LLAMA_LOG_PATH;
 	const tempDirs: string[] = [];
 
 	function tempFile(name: string): string {
@@ -53,6 +54,8 @@ describe("LocalModelRuntimeManager", () => {
 	afterEach(() => {
 		if (originalServerBin === undefined) delete process.env.LLAMA_CPP_SERVER_BIN;
 		else process.env.LLAMA_CPP_SERVER_BIN = originalServerBin;
+		if (originalLogPath === undefined) delete process.env.PI_LOCAL_LLAMA_LOG_PATH;
+		else process.env.PI_LOCAL_LLAMA_LOG_PATH = originalLogPath;
 	});
 
 	it("reports runtime_unavailable when llama-server cannot be found", async () => {
@@ -127,6 +130,54 @@ describe("LocalModelRuntimeManager", () => {
 		);
 		expect(processes).toHaveLength(1);
 		expect(states).toEqual(["starting_server", "loading_model", "ready"]);
+	});
+
+	it("starts Qwen-compatible models with the bundled Sharp chat template", async () => {
+		const modelPath = tempFile("KAT-Coder-V2.5-Dev-MTP-APEX-i-quality-v2.gguf");
+		const startCalls: Array<{ args: string[] }> = [];
+		const manager = new LocalModelRuntimeManager({
+			operations: {
+				executableExists: async () => true,
+				modelExists: async () => true,
+				allocatePort: async () => 49167,
+				start: (_command, args) => {
+					startCalls.push({ args });
+					return new FakeProcess();
+				},
+				waitUntilReady: async () => {},
+			},
+		});
+
+		await manager.ensureReady({ id: "KAT-Coder-V2.5-Dev-MTP-APEX-i-quality-v2", path: modelPath });
+
+		const args = startCalls[0]?.args ?? [];
+		const templateFlagIndex = args.indexOf("--chat-template-file");
+		expect(templateFlagIndex).toBeGreaterThanOrEqual(0);
+		expect(args[templateFlagIndex + 1]).toMatch(/qwen-sharp-chat-template\.jinja$/);
+		expect(args).toEqual(expect.arrayContaining(["--reasoning-format", "deepseek"]));
+	});
+
+	it("does not apply the bundled Sharp chat template to non-Qwen models", async () => {
+		const modelPath = tempFile("llama.gguf");
+		const startCalls: Array<{ args: string[] }> = [];
+		const manager = new LocalModelRuntimeManager({
+			operations: {
+				executableExists: async () => true,
+				modelExists: async () => true,
+				allocatePort: async () => 49168,
+				start: (_command, args) => {
+					startCalls.push({ args });
+					return new FakeProcess();
+				},
+				waitUntilReady: async () => {},
+			},
+		});
+
+		await manager.ensureReady({ id: "llama", path: modelPath });
+
+		const args = startCalls[0]?.args ?? [];
+		expect(args).not.toContain("--chat-template-file");
+		expect(args).not.toContain("--reasoning-format");
 	});
 
 	it("stops the previous process when switching models", async () => {
@@ -258,6 +309,73 @@ describe("LocalModelRuntimeManager", () => {
 		expect(slept).toEqual([3_000]);
 		expect(processes).toHaveLength(2);
 		expect(manager.getState()).toMatchObject({ value: "ready", modelId: "model" });
+	});
+
+	it("passes the configured readiness timeout to the readiness waiter", async () => {
+		const modelPath = tempFile("model.gguf");
+		let receivedReadyTimeoutMs: number | undefined;
+		const manager = new LocalModelRuntimeManager({
+			readyTimeoutMs: 600_000,
+			operations: {
+				executableExists: async () => true,
+				modelExists: async () => true,
+				allocatePort: async () => 49164,
+				start: () => new FakeProcess(),
+				waitUntilReady: async (_baseUrl, _signal, readyTimeoutMs) => {
+					receivedReadyTimeoutMs = readyTimeoutMs;
+				},
+			},
+		});
+
+		await manager.ensureReady({ id: "model", path: modelPath });
+
+		expect(receivedReadyTimeoutMs).toBe(600_000);
+	});
+
+	it("marks retained processes so they can survive parent exit", async () => {
+		const modelPath = tempFile("model.gguf");
+		let receivedRetainAfterParentExit: boolean | undefined;
+		const manager = new LocalModelRuntimeManager({
+			retainAfterParentExit: true,
+			operations: {
+				executableExists: async () => true,
+				modelExists: async () => true,
+				allocatePort: async () => 49165,
+				start: (_command, _args, options) => {
+					receivedRetainAfterParentExit = options.retainAfterParentExit;
+					return new FakeProcess();
+				},
+				waitUntilReady: async () => {},
+			},
+		});
+
+		await manager.ensureReady({ id: "model", path: modelPath });
+
+		expect(receivedRetainAfterParentExit).toBe(true);
+	});
+
+	it("passes the retained runtime log path to the process starter", async () => {
+		const modelPath = tempFile("model.gguf");
+		const logPath = tempFile("llama-server.log");
+		let receivedLogPath: string | undefined;
+		const manager = new LocalModelRuntimeManager({
+			retainAfterParentExit: true,
+			logPath,
+			operations: {
+				executableExists: async () => true,
+				modelExists: async () => true,
+				allocatePort: async () => 49166,
+				start: (_command, _args, options) => {
+					receivedLogPath = options.logPath;
+					return new FakeProcess();
+				},
+				waitUntilReady: async () => {},
+			},
+		});
+
+		await manager.ensureReady({ id: "model", path: modelPath });
+
+		expect(receivedLogPath).toBe(logPath);
 	});
 
 	it("wraps process startup failures as load_failed", async () => {

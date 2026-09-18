@@ -36,7 +36,13 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "logout", description: "Remove provider authentication" },
 	{ name: "new", description: "Start a new session" },
 	{ name: "compact", description: "Manually compact the session context" },
+	{
+		name: "goal",
+		description: "Start, show, or stop a bounded long-running goal",
+		argumentHint: "<objective|status|stop>",
+	},
 	{ name: "resume", description: "Resume a different session" },
 	{ name: "reload", description: "Reload keybindings, extensions, skills, prompts, themes, and context files" },
+	{ name: "semantic-refresh", description: "Manually rebuild the workspace semantic index and vectors" },
 	{ name: "quit", description: `Quit ${APP_NAME}` },
 ];

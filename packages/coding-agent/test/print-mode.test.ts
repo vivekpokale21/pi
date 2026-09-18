@@ -1,7 +1,10 @@
-import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type Context, contentText, type ImageContent, type Model } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createGoalStore } from "../src/core/goal-state.ts";
 import type { SessionShutdownEvent } from "../src/index.ts";
 import { runPrintMode } from "../src/modes/print-mode.ts";
+import { createHarness, type Harness } from "./suite/harness.ts";
 
 type EmitEvent = SessionShutdownEvent;
 
@@ -23,6 +26,26 @@ type FakeSession = {
 
 type FakeRuntimeHost = {
 	session: FakeSession;
+	newSession: ReturnType<typeof vi.fn>;
+	fork: ReturnType<typeof vi.fn>;
+	switchSession: ReturnType<typeof vi.fn>;
+	dispose: ReturnType<typeof vi.fn>;
+	setRebindSession: ReturnType<typeof vi.fn>;
+};
+
+type HarnessRuntimeHost = {
+	session: Harness["session"];
+	services: {
+		semanticIndex: {
+			ready: Promise<void>;
+			vectorsReady: Promise<void>;
+			vectorStatus: "ready";
+		};
+		modelRuntime: {
+			getLocalModelRuntimeProcessId: () => undefined;
+			getLocalModelRuntimeState: () => undefined;
+		};
+	};
 	newSession: ReturnType<typeof vi.fn>;
 	fork: ReturnType<typeof vi.fn>;
 	switchSession: ReturnType<typeof vi.fn>;
@@ -86,6 +109,49 @@ function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost 
 	};
 }
 
+function createHarnessRuntimeHost(harness: Harness): HarnessRuntimeHost {
+	return {
+		session: harness.session,
+		services: {
+			semanticIndex: {
+				ready: Promise.resolve(),
+				vectorsReady: Promise.resolve(),
+				vectorStatus: "ready",
+			},
+			modelRuntime: {
+				getLocalModelRuntimeProcessId: () => undefined,
+				getLocalModelRuntimeState: () => undefined,
+			},
+		},
+		newSession: vi.fn(async () => undefined),
+		fork: vi.fn(async () => ({ selectedText: "" })),
+		switchSession: vi.fn(async () => undefined),
+		dispose: vi.fn(async () => undefined),
+		setRebindSession: vi.fn(),
+	};
+}
+
+function appendAssistantUsage(harness: Harness, model: Model<string>, tokens: number): void {
+	harness.sessionManager.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "old transcript only" }],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: tokens,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: tokens,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now() - 1000,
+	});
+	harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+}
+
 afterEach(() => {
 	vi.restoreAllMocks();
 });
@@ -138,5 +204,63 @@ describe("runPrintMode", () => {
 		expect(errorSpy).toHaveBeenCalledWith("provider failure");
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+	});
+
+	it("continues from a low-context handoff in the same print-mode session", async () => {
+		const harness = await createHarness();
+		const runtimeHost = createHarnessRuntimeHost(harness);
+		let postResumeContext: Context | undefined;
+		try {
+			await createGoalStore(harness.tempDir).start({ objective: "Continue native workflow." });
+			const model = harness.getModel();
+			appendAssistantUsage(harness, model, Math.floor((model.contextWindow ?? 128_000) * 0.86));
+			harness.setResponses([
+				fauxAssistantMessage(
+					fauxToolCall("handoff", {
+						profile: "planner",
+						title: "Continue Native Workflow",
+						goal: "Continue the native planner/executor handoff workflow.",
+						nonGoals: ["Do not use the legacy migration harness."],
+						inspectedFiles: ["packages/coding-agent/src/modes/print-mode.ts"],
+						facts: ["Print mode receives AgentSession events."],
+						decisions: ["Resume in the same AgentSession."],
+						plan: ["Implement print-mode handoff continuation."],
+						verification: ["node node_modules/vitest/dist/cli.js --run test/print-mode.test.ts"],
+						staleStateChecks: ["Run git status before editing."],
+						risks: ["A handoff write can be mistaken for completed continuation."],
+						stopConditions: ["Stop if validation fails."],
+						unexplored: ["Interactive status rendering."],
+						completed: ["Handoff write event exists."],
+						nextSlice: ["Implement print-mode continuation."],
+					}),
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("handoff written"),
+				(context) => {
+					postResumeContext = context;
+					return fauxAssistantMessage("post resume done");
+				},
+			]);
+
+			const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+				mode: "text",
+				initialMessage: "continue until handoff",
+			});
+
+			expect(exitCode).toBe(0);
+			expect(harness.eventsOfType("context_handoff_required")).toHaveLength(1);
+			expect(harness.eventsOfType("context_handoff_written")).toHaveLength(1);
+			expect(harness.eventsOfType("context_handoff_resume_started")).toHaveLength(1);
+			expect(harness.eventsOfType("context_handoff_resume_completed")).toHaveLength(1);
+			expect(harness.faux.state.callCount).toBe(3);
+			const postResumeText = postResumeContext?.messages
+				.map((message) => contentText(message.content, ""))
+				.join("\n");
+			expect(postResumeText).toContain("Continuation path: planner -> executor.");
+			expect(postResumeText).toContain("# Planner Handoff: Continue Native Workflow");
+			expect(postResumeText).not.toContain("old transcript only");
+		} finally {
+			harness.cleanup();
+		}
 	});
 });

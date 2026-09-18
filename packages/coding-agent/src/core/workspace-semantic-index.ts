@@ -9,6 +9,12 @@ import { parseWorkspaceChunks, type WorkspaceSemanticChunk } from "./workspace-p
 export type WorkspaceSemanticIndexStatus = "not_started" | "scanning" | "lexical_ready" | "failed";
 export type WorkspaceSemanticVectorStatus = "disabled" | "not_started" | "building" | "ready" | "failed";
 
+export interface WorkspaceSemanticIndexStaleness {
+	fileChangeCount: number;
+	ageMs: number;
+	significant: boolean;
+}
+
 export interface WorkspaceSemanticEmbeddingProvider {
 	/** Optional stable identity for callers that persist or share embedding configuration. */
 	id?: string;
@@ -77,9 +83,10 @@ export interface WorkspaceSemanticSearchResponse {
 	status: WorkspaceSemanticIndexStatus;
 	vectorStatus: WorkspaceSemanticVectorStatus;
 	completeness: "complete" | "incomplete";
-	freshness: "clean" | "unknown";
+	freshness: "clean" | "stale" | "unknown";
 	indexRevision: string;
 	indexedFiles: number;
+	staleFileChangeCount?: number;
 	novelResults: number;
 	overlapWarning?: string;
 	recommendedNextAction?: "narrow_query";
@@ -150,6 +157,8 @@ const DEFAULT_MAX_FILE_SIZE_BYTES = 512 * 1024;
 const DEFAULT_CACHE_NAME = ".semantic_search/index.json";
 const DEFAULT_MAX_CACHE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_EMBEDDING_BATCH_SIZE = 32;
+const SIGNIFICANT_STALE_CHANGE_COUNT = 10;
+const SIGNIFICANT_STALE_AGE_MS = 10 * 60 * 1000;
 const IGNORED_DIRECTORIES = new Set([".git", "node_modules", "dist", "build", "target", ".semantic_search"]);
 
 function isBinary(buffer: Buffer): boolean {
@@ -215,7 +224,6 @@ export class WorkspaceSemanticIndex {
 	private readonly watchers: FSWatcher[] = [];
 	private readonly scannedDirectories = new Set<string>();
 	private readonly vectors = new Map<string, number[]>();
-	private refreshTimer?: ReturnType<typeof setTimeout>;
 	private controller?: AbortController;
 	private resolveReady!: () => void;
 	private readyPromise!: Promise<void>;
@@ -227,6 +235,8 @@ export class WorkspaceSemanticIndex {
 	private _indexRevision = "empty";
 	private _loadedFromCache = false;
 	private _cacheCompacted = false;
+	private staleSinceMs?: number;
+	private staleFileChangeCount = 0;
 
 	constructor(root: string, options: WorkspaceSemanticIndexOptions = {}) {
 		this.root = resolve(root);
@@ -282,6 +292,15 @@ export class WorkspaceSemanticIndex {
 		return this._cacheCompacted;
 	}
 
+	get staleness(): WorkspaceSemanticIndexStaleness {
+		const ageMs = this.staleSinceMs === undefined ? 0 : Math.max(0, Date.now() - this.staleSinceMs);
+		return {
+			fileChangeCount: this.staleFileChangeCount,
+			ageMs,
+			significant: this.staleFileChangeCount >= SIGNIFICANT_STALE_CHANGE_COUNT || ageMs >= SIGNIFICANT_STALE_AGE_MS,
+		};
+	}
+
 	start(): void {
 		if (this._status === "scanning" || this._status === "lexical_ready") return;
 		this.resetReadyPromise();
@@ -305,6 +324,7 @@ export class WorkspaceSemanticIndex {
 		this.returnedChunkIds.clear();
 		this._loadedFromCache = false;
 		this._indexRevision = "empty";
+		this.clearStaleness();
 		this._vectorStatus = this.options.embedding ? "not_started" : "disabled";
 		this._vectorWarning = undefined;
 		this.resetReadyPromise();
@@ -324,6 +344,7 @@ export class WorkspaceSemanticIndex {
 		this.returnedChunkIds.clear();
 		this._loadedFromCache = false;
 		this._indexRevision = "empty";
+		this.clearStaleness();
 		this._vectorStatus = this.options.embedding ? "not_started" : "disabled";
 		this._vectorWarning = undefined;
 		this._status = "not_started";
@@ -430,9 +451,10 @@ export class WorkspaceSemanticIndex {
 			status: this._status,
 			vectorStatus: this._vectorStatus,
 			completeness: incomplete ? "incomplete" : "complete",
-			freshness: this._status === "lexical_ready" ? "clean" : "unknown",
+			freshness: this._status === "lexical_ready" ? (this.staleFileChangeCount > 0 ? "stale" : "clean") : "unknown",
 			indexRevision: this._indexRevision,
 			indexedFiles: this.files.size,
+			...(this.staleFileChangeCount > 0 ? { staleFileChangeCount: this.staleFileChangeCount } : {}),
 			novelResults,
 			overlapWarning:
 				results.length > 0 && novelResults === 0
@@ -563,13 +585,23 @@ export class WorkspaceSemanticIndex {
 		if (!this.options.embedding) this.resolveVectorsReady();
 	}
 
+	private clearStaleness(): void {
+		this.staleSinceMs = undefined;
+		this.staleFileChangeCount = 0;
+	}
+
+	private markStale(): void {
+		this.staleSinceMs ??= Date.now();
+		this.staleFileChangeCount += 1;
+	}
+
 	private startWatcher(): void {
 		if (this.watchers.length > 0) return;
 		for (const directory of this.scannedDirectories) {
 			try {
 				this.watchers.push(
 					watch(directory, { persistent: false }, () => {
-						if (this._status !== "scanning") this.scheduleRefresh();
+						if (this._status !== "scanning") this.markStale();
 					}),
 				);
 			} catch {
@@ -578,17 +610,7 @@ export class WorkspaceSemanticIndex {
 		}
 	}
 
-	private scheduleRefresh(): void {
-		if (this.refreshTimer) clearTimeout(this.refreshTimer);
-		this.refreshTimer = setTimeout(() => {
-			this.refreshTimer = undefined;
-			void this.refresh();
-		}, 50);
-	}
-
 	private closeWatchers(): void {
-		if (this.refreshTimer) clearTimeout(this.refreshTimer);
-		this.refreshTimer = undefined;
 		for (const watcher of this.watchers.splice(0)) watcher.close();
 	}
 

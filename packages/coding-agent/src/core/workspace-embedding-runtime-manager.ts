@@ -22,8 +22,10 @@ export interface WorkspaceEmbeddingRuntimeEndpoint {
 }
 
 export interface WorkspaceEmbeddingRuntimeProcess {
+	pid?: number;
 	onExit(listener: (code: number | null, signal: NodeJS.Signals | null) => void): () => void;
 	kill(signal?: NodeJS.Signals): void;
+	getOutput?(): string;
 }
 
 export interface WorkspaceEmbeddingRuntimeStartOptions {
@@ -63,6 +65,7 @@ export class WorkspaceEmbeddingRuntimeError extends Error {
 type StateListener = (state: WorkspaceEmbeddingRuntimeState) => void;
 
 const DEFAULT_READY_TIMEOUT_MS = 120_000;
+const MAX_EMBEDDING_RUNTIME_OUTPUT_BYTES = 16_000;
 
 function commandExecutable(command: string): string {
 	return command.trim().split(/\s+/u)[0] ?? "";
@@ -92,12 +95,19 @@ function defaultStart(
 	command: string,
 	options: WorkspaceEmbeddingRuntimeStartOptions,
 ): WorkspaceEmbeddingRuntimeProcess {
+	let output = "";
+	const appendOutput = (chunk: Buffer) => {
+		output = `${output}${chunk.toString()}`.slice(-MAX_EMBEDDING_RUNTIME_OUTPUT_BYTES);
+	};
 	const child = spawn("bash", ["-lc", command], {
 		cwd: options.cwd,
 		env: options.env,
 		stdio: ["ignore", "pipe", "pipe"],
 	});
+	child.stdout?.on("data", appendOutput);
+	child.stderr?.on("data", appendOutput);
 	return {
+		pid: child.pid,
 		onExit: (listener) => {
 			child.on("exit", listener);
 			return () => child.off("exit", listener);
@@ -105,6 +115,7 @@ function defaultStart(
 		kill: (signal = "SIGTERM") => {
 			child.kill(signal);
 		},
+		getOutput: () => output.trim(),
 	};
 }
 
@@ -177,6 +188,14 @@ export class WorkspaceEmbeddingRuntimeManager {
 		return { ...this.state };
 	}
 
+	getProcessId(): number | undefined {
+		return this.process?.pid;
+	}
+
+	getStartCommand(): string {
+		return this.startCommand;
+	}
+
 	subscribe(listener: StateListener): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
@@ -191,6 +210,15 @@ export class WorkspaceEmbeddingRuntimeManager {
 		const state = { value: code, baseUrl: this.baseUrl, message };
 		this.setState(state);
 		return new WorkspaceEmbeddingRuntimeError(code, message, state);
+	}
+
+	private errorWithProcessOutput(
+		code: WorkspaceEmbeddingRuntimeError["code"],
+		message: string,
+	): WorkspaceEmbeddingRuntimeError {
+		const output = this.process?.getOutput?.();
+		const fullMessage = output ? `${message}\nEmbedding server output:\n${output}` : message;
+		return this.error(code, fullMessage);
 	}
 
 	async ensureReady(signal?: AbortSignal): Promise<WorkspaceEmbeddingRuntimeEndpoint> {
@@ -242,8 +270,10 @@ export class WorkspaceEmbeddingRuntimeManager {
 		try {
 			await this.operations.waitUntilReady(this.baseUrl, signal);
 		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const runtimeError = this.errorWithProcessOutput("load_failed", message);
 			await this.stopCurrent();
-			throw this.error("load_failed", error instanceof Error ? error.message : String(error));
+			throw runtimeError;
 		}
 		this.endpoint = { baseUrl: this.baseUrl };
 		this.setState({ value: "ready", baseUrl: this.baseUrl });

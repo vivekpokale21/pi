@@ -122,6 +122,7 @@ describe("InteractiveMode.showStatus", () => {
 		const fakeThis: any = {
 			isInitialized: true,
 			footer: { invalidate: vi.fn() },
+			ui: { requestRender: vi.fn() },
 			showStatus: vi.fn((message: string) => statuses.push(message)),
 		};
 
@@ -155,6 +156,69 @@ describe("InteractiveMode.showStatus", () => {
 			"Local model qwen ready at http://127.0.0.1:49160",
 			"Local model qwen runtime unavailable: llama-server is not available: llama-server",
 		]);
+	});
+
+	test("shows handoff continuation statuses and resumes after settle", async () => {
+		const statuses: string[] = [];
+		const errors: string[] = [];
+		const fakeThis: any = {
+			isInitialized: true,
+			footer: { invalidate: vi.fn() },
+			ui: { requestRender: vi.fn() },
+			showStatus: vi.fn((message: string) => statuses.push(message)),
+			showError: vi.fn((message: string) => errors.push(message)),
+			checkShutdownRequested: vi.fn(async () => {}),
+			continueFromPendingHandoff: (InteractiveMode as any).prototype.continueFromPendingHandoff,
+			session: {
+				getPendingHandoffContinuationIntent: () => ({
+					band: "handoff_required",
+					originalGoal: "Continue native workflow.",
+					sourceProfile: "planner",
+					createdAt: 1,
+				}),
+				continueFromHandoff: vi.fn(async () => ({ handoffPath: ".pi/handoffs/continue.md" })),
+				prompt: vi.fn(async () => {}),
+			},
+		};
+
+		await (InteractiveMode as any).prototype.handleEvent.call(fakeThis, {
+			type: "context_handoff_required",
+			band: "handoff_required",
+			originalGoal: "Continue native workflow.",
+			sourceProfile: "planner",
+		});
+		await (InteractiveMode as any).prototype.handleEvent.call(fakeThis, {
+			type: "context_handoff_written",
+			handoffPath: ".pi/handoffs/continue.md",
+			profile: "planner",
+			title: "Continue",
+			bytes: 1200,
+			sourceProfile: "planner",
+		});
+		await (InteractiveMode as any).prototype.handleEvent.call(fakeThis, {
+			type: "context_handoff_resume_started",
+			handoffPath: ".pi/handoffs/continue.md",
+			transition: "planner_to_executor",
+		});
+		await (InteractiveMode as any).prototype.handleEvent.call(fakeThis, {
+			type: "context_handoff_resume_failed",
+			handoffPath: ".pi/handoffs/continue.md",
+			transition: "planner_to_executor",
+			error: "validation failed",
+		});
+		await (InteractiveMode as any).prototype.handleEvent.call(fakeThis, { type: "agent_settled" });
+
+		expect(statuses).toEqual([
+			"Context handoff required: active goal needs a handoff before broad work continues",
+			"Context handoff: wrote .pi/handoffs/continue.md",
+			"Context handoff: starting fresh executor context from .pi/handoffs/continue.md",
+		]);
+		expect(errors).toEqual(["Context handoff failed: validation failed"]);
+		expect(fakeThis.session.continueFromHandoff).toHaveBeenCalledWith({
+			handoffPath: ".pi/handoffs/continue.md",
+			originalGoal: "Continue native workflow.",
+		});
+		expect(fakeThis.session.prompt).toHaveBeenCalledWith("continue");
 	});
 });
 

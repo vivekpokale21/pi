@@ -62,7 +62,13 @@ import {
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.ts";
-import { buildContextBudgetReminder, type ContextBudgetBand, getContextBudgetReminderBand } from "./context-handoff.ts";
+import {
+	buildContextBudgetReminder,
+	type ContextBudgetBand,
+	getContextBudgetReminderBand,
+	type HandoffContinuationPath,
+	type HandoffProfile,
+} from "./context-handoff.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -93,6 +99,13 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import type { GoalState } from "./goal-state.ts";
+import { createGoalStore } from "./goal-state.ts";
+import {
+	type ContinueFromHandoffResult,
+	continueFromHandoff,
+	validateHandoffForContinuation,
+} from "./handoff-continuation.ts";
 import type { LocalModelRuntimeState } from "./local-model-runtime-manager.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
@@ -106,6 +119,7 @@ import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
+import type { HandoffToolDetails } from "./tools/handoff.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
@@ -182,7 +196,37 @@ export type AgentSessionEvent =
 	  }
 	| { type: "summarization_retry_finished" }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
-	| { type: "bash_execution_update"; id?: string; delta: string };
+	| { type: "bash_execution_update"; id?: string; delta: string }
+	| {
+			type: "context_handoff_required";
+			band: "handoff_required";
+			originalGoal: string;
+			sourceProfile: HandoffProfile;
+	  }
+	| {
+			type: "context_handoff_written";
+			handoffPath: string;
+			profile: HandoffProfile;
+			title: string;
+			bytes: number;
+			sourceProfile: HandoffProfile;
+	  }
+	| {
+			type: "context_handoff_resume_started";
+			handoffPath: string;
+			transition: HandoffContinuationPath;
+	  }
+	| {
+			type: "context_handoff_resume_failed";
+			handoffPath: string;
+			transition: HandoffContinuationPath;
+			error: string;
+	  }
+	| {
+			type: "context_handoff_resume_completed";
+			handoffPath: string;
+			transition: HandoffContinuationPath;
+	  };
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -264,6 +308,25 @@ export interface PromptOptions {
 	preflightResult?: (success: boolean) => void;
 }
 
+export interface HandoffContinuationContextInput {
+	prompt: string;
+	handoffPath: string;
+	transition: HandoffContinuationPath;
+}
+
+export interface AgentSessionHandoffContinuationInput {
+	handoffPath: string;
+	originalGoal: string;
+	transition?: HandoffContinuationPath;
+}
+
+export interface HandoffContinuationIntent {
+	band: "handoff_required";
+	originalGoal: string;
+	sourceProfile: HandoffProfile;
+	createdAt: number;
+}
+
 /** Result from cycleModel() */
 export interface ModelCycleResult {
 	model: Model<any>;
@@ -305,6 +368,19 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	return tokens;
 }
 
+function isHandoffToolDetails(value: unknown): value is HandoffToolDetails {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const record = value as Record<string, unknown>;
+	return (
+		typeof record.path === "string" &&
+		(record.profile === "planner" || record.profile === "executor") &&
+		typeof record.title === "string" &&
+		typeof record.bytes === "number"
+	);
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -341,6 +417,13 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	private _pendingHandoffContinuationCompletion:
+		| {
+				handoffPath: string;
+				transition: HandoffContinuationPath;
+		  }
+		| undefined = undefined;
+	private readonly _consumedHandoffContinuationPaths = new Set<string>();
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -391,6 +474,8 @@ export class AgentSession {
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 	private _systemPromptOverride?: string;
 	private _lastContextBudgetReminderBand?: ContextBudgetBand;
+	private _currentHandoffProfile: HandoffProfile = "planner";
+	private _pendingHandoffContinuationIntent?: HandoffContinuationIntent;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -571,7 +656,11 @@ export class AgentSession {
 		this.agent.convertToLlm = async (messages) => {
 			const expandedMessages: AgentMessage[] = [];
 			for (const message of messages) {
-				if (message.role === "custom" && message.customType === "context_budget_reminder") {
+				if (
+					message.role === "custom" &&
+					(message.customType === "context_budget_reminder" ||
+						message.customType === "context_handoff_continuation")
+				) {
 					expandedMessages.push({
 						role: "user",
 						content: message.content,
@@ -665,6 +754,9 @@ export class AgentSession {
 
 		// Notify all listeners
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+		if (event.type === "tool_execution_end") {
+			this._handleToolExecutionEnd(event);
+		}
 
 		// Handle session persistence
 		if (event.type === "message_end") {
@@ -692,6 +784,14 @@ export class AgentSession {
 				this._lastAssistantMessage = event.message;
 
 				const assistantMsg = event.message as AssistantMessage;
+				if (assistantMsg.stopReason !== "error" && this._pendingHandoffContinuationCompletion) {
+					this._emit({
+						type: "context_handoff_resume_completed",
+						...this._pendingHandoffContinuationCompletion,
+					});
+					this._pendingHandoffContinuationCompletion = undefined;
+				}
+
 				if (assistantMsg.stopReason !== "error") {
 					this._overflowRecoveryAttempted = false;
 				}
@@ -709,6 +809,22 @@ export class AgentSession {
 			}
 		}
 	};
+
+	private _handleToolExecutionEnd(event: Extract<AgentEvent, { type: "tool_execution_end" }>): void {
+		if (event.toolName !== "handoff" || event.isError || !isHandoffToolDetails(event.result?.details)) {
+			return;
+		}
+		const details = event.result.details;
+		this._currentHandoffProfile = details.profile;
+		this._emit({
+			type: "context_handoff_written",
+			handoffPath: details.path,
+			profile: details.profile,
+			title: details.title,
+			bytes: details.bytes,
+			sourceProfile: this._pendingHandoffContinuationIntent?.sourceProfile ?? details.profile,
+		});
+	}
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		const settings = this.settingsManager.getRetrySettings();
@@ -1002,6 +1118,10 @@ export class AgentSession {
 		return this.agent.state.messages;
 	}
 
+	getPendingHandoffContinuationIntent(): HandoffContinuationIntent | undefined {
+		return this._pendingHandoffContinuationIntent;
+	}
+
 	/** Current steering mode */
 	get steeringMode(): "all" | "one-at-a-time" {
 		return this.agent.steeringMode;
@@ -1120,7 +1240,7 @@ export class AgentSession {
 		}
 	}
 
-	private _buildContextBudgetReminderMessage(): CustomMessage | undefined {
+	private async _buildContextBudgetReminderMessage(): Promise<CustomMessage | undefined> {
 		const usage = this.getContextUsage();
 		if (!usage) {
 			this._lastContextBudgetReminderBand = undefined;
@@ -1152,6 +1272,9 @@ export class AgentSession {
 		}
 
 		this._lastContextBudgetReminderBand = band;
+		if (band === "handoff_required") {
+			await this._recordHandoffRequiredIntent();
+		}
 		return {
 			role: "custom",
 			customType: "context_budget_reminder",
@@ -1159,6 +1282,27 @@ export class AgentSession {
 			display: false,
 			timestamp: Date.now(),
 		};
+	}
+
+	private async _recordHandoffRequiredIntent(): Promise<void> {
+		const activeGoal: GoalState | undefined = await createGoalStore(this._cwd).getActive();
+		if (!activeGoal?.autoContinue) {
+			return;
+		}
+
+		const intent: HandoffContinuationIntent = {
+			band: "handoff_required",
+			originalGoal: activeGoal.objective,
+			sourceProfile: this._currentHandoffProfile,
+			createdAt: Date.now(),
+		};
+		this._pendingHandoffContinuationIntent = intent;
+		this._emit({
+			type: "context_handoff_required",
+			band: intent.band,
+			originalGoal: intent.originalGoal,
+			sourceProfile: intent.sourceProfile,
+		});
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
@@ -1200,6 +1344,62 @@ export class AgentSession {
 	 * @throws Error if streaming and no streamingBehavior specified
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
+	injectHandoffContinuationContext(input: HandoffContinuationContextInput): void {
+		const prompt = input.prompt.trim();
+		if (prompt.length === 0) {
+			throw new Error("Handoff continuation prompt must be recorded");
+		}
+		const previousUsage = this.getContextUsage();
+		const previousTokens =
+			previousUsage?.tokens ?? estimateMessagesTokens(this.sessionManager.buildSessionContext().messages);
+		const continuationEntryId = this.sessionManager.appendCustomMessageEntry(
+			"context_handoff_continuation",
+			[{ type: "text", text: prompt }],
+			false,
+			{
+				handoffPath: input.handoffPath,
+				transition: input.transition,
+			},
+		);
+		this.sessionManager.appendCompaction(
+			"Context reset for handoff continuation. Prior transcript remains in the session log; use the validated handoff artifact as the continuation source of truth.",
+			continuationEntryId,
+			previousTokens,
+			{ source: "context_handoff", handoffPath: input.handoffPath, transition: input.transition },
+			false,
+		);
+		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
+		this._lastContextBudgetReminderBand = undefined;
+		this._pendingHandoffContinuationCompletion = {
+			handoffPath: input.handoffPath,
+			transition: input.transition,
+		};
+	}
+
+	async continueFromHandoff(
+		input: AgentSessionHandoffContinuationInput,
+	): Promise<ContinueFromHandoffResult<{ contextInjected: true }>> {
+		return await continueFromHandoff({
+			goalStore: createGoalStore(this._cwd),
+			transition: input.transition,
+			originalGoal: input.originalGoal,
+			handoffPath: input.handoffPath,
+			consumedHandoffPaths: this._consumedHandoffContinuationPaths,
+			validateHandoff: async (path) => await validateHandoffForContinuation(this._cwd, path),
+			injectContinuationContext: async ({ injectedPrompt, transition }) => {
+				this.injectHandoffContinuationContext({
+					prompt: injectedPrompt,
+					handoffPath: input.handoffPath,
+					transition,
+				});
+				this._currentHandoffProfile = transition === "planner_to_planner" ? "planner" : "executor";
+				this._pendingHandoffContinuationIntent = undefined;
+				return { contextInjected: true };
+			},
+			emit: (event) => this._emit(event),
+		});
+	}
+
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
@@ -1293,7 +1493,7 @@ export class AgentSession {
 			// Build messages array (custom message if any, then user message)
 			messages = [];
 
-			const contextBudgetReminder = this._buildContextBudgetReminderMessage();
+			const contextBudgetReminder = await this._buildContextBudgetReminderMessage();
 			if (contextBudgetReminder) {
 				messages.push(contextBudgetReminder);
 			}

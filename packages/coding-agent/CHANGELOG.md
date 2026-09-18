@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added an opt-in CUDA device mode for the bundled CodeRankEmbed semantic embedding server while keeping CPU as the default.
+- Added the Qwen Sharp chat template for local Qwen/KAT GGUF models served through llama.cpp.
 - Exposed `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL` to commands run by built-in and factory-created bash tools.
 
 ### Fixed

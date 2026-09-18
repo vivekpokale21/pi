@@ -4,6 +4,7 @@ import type { AgentSession } from "../../../core/agent-session.ts";
 import { areExperimentalFeaturesEnabled } from "../../../core/experimental.ts";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
 import { addUsageToTotals, createUsageTotals } from "../../../core/usage-totals.ts";
+import type { WorkspaceSemanticIndex } from "../../../core/workspace-semantic-index.ts";
 import { theme } from "../theme/theme.ts";
 
 /**
@@ -51,14 +52,21 @@ export class FooterComponent implements Component {
 	private autoCompactEnabled = true;
 	private session: AgentSession;
 	private footerData: ReadonlyFooterDataProvider;
+	private semanticIndex: Pick<WorkspaceSemanticIndex, "staleness" | "vectorStatus"> | undefined;
 
-	constructor(session: AgentSession, footerData: ReadonlyFooterDataProvider) {
+	constructor(
+		session: AgentSession,
+		footerData: ReadonlyFooterDataProvider,
+		semanticIndex?: Pick<WorkspaceSemanticIndex, "staleness" | "vectorStatus">,
+	) {
 		this.session = session;
 		this.footerData = footerData;
+		this.semanticIndex = semanticIndex;
 	}
 
-	setSession(session: AgentSession): void {
+	setSession(session: AgentSession, semanticIndex?: Pick<WorkspaceSemanticIndex, "staleness" | "vectorStatus">): void {
 		this.session = session;
+		this.semanticIndex = semanticIndex;
 	}
 
 	setAutoCompactEnabled(enabled: boolean): void {
@@ -238,6 +246,13 @@ export class FooterComponent implements Component {
 			const statusLine = sortedStatuses.join(" ");
 			// Truncate to terminal width with dim ellipsis for consistency with footer style
 			lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
+		}
+
+		const semanticStaleness = this.semanticIndex?.staleness;
+		if (this.semanticIndex?.vectorStatus === "ready" && semanticStaleness?.significant) {
+			const ageMinutes = Math.max(1, Math.round(semanticStaleness.ageMs / 60_000));
+			const warning = `Semantic vectors stale (${semanticStaleness.fileChangeCount} changes, ${ageMinutes}m). Use /semantic-refresh to rebuild.`;
+			lines.push(truncateToWidth(theme.fg("warning", warning), width, theme.fg("dim", "...")));
 		}
 
 		return lines;

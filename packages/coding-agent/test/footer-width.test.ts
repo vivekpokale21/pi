@@ -222,4 +222,21 @@ describe("FooterComponent width handling", () => {
 
 		expect(stripAnsi(footer.render(120)[1])).toContain("$1.234 (sub)");
 	});
+
+	it("shows a warning when semantic vectors are stale enough to matter", () => {
+		const session = createSession({ sessionName: "" });
+		const semanticIndex = {
+			staleness: {
+				fileChangeCount: 12,
+				ageMs: 11 * 60 * 1000,
+				significant: true,
+			},
+			vectorStatus: "ready" as const,
+		};
+		const footer = new FooterComponent(session, createFooterData(1), semanticIndex);
+
+		const lines = footer.render(120).map(stripAnsi);
+
+		expect(lines.at(-1)).toContain("Semantic vectors stale");
+	});
 });

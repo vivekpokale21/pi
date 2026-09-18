@@ -268,6 +268,50 @@ describe("local model provider runtime handoff", () => {
 		});
 	});
 
+	it("applies native Qwen compatibility metadata and payload defaults to KAT coder models", async () => {
+		const dir = tempDir();
+		touch(join(dir, "KAT-Coder-V2.5-Dev-MTP-APEX-i-quality-v2.gguf"));
+		const payloads: unknown[] = [];
+		const streamCalls: Array<{ model: Model<"openai-completions">; options: SimpleStreamOptions | undefined }> = [];
+		const provider = await createLocalModelProvider({
+			modelsDir: dir,
+			runtimeManager: {
+				ensureReady: async () => ({ baseUrl: "http://127.0.0.1:49166", apiKey: "local" }),
+				inferenceBaseUrl: (endpoint) => `${endpoint.baseUrl}/v1`,
+			},
+			streams: {
+				stream: (model) => doneStream(model),
+				streamSimple: (model, _context, options) => {
+					streamCalls.push({ model, options });
+					const payload = { model: model.id };
+					payloads.push(options?.onPayload ? options.onPayload(payload, model) : payload);
+					return doneStream(model);
+				},
+			},
+		});
+		const model = provider.getModels()[0]!;
+
+		await provider.streamSimple(model, { messages: [] }, { reasoning: "low" }).result();
+
+		expect(streamCalls[0]?.model).toMatchObject({
+			id: "KAT-Coder-V2.5-Dev-MTP-APEX-i-quality-v2",
+			reasoning: true,
+			contextWindow: 131072,
+			compat: {
+				thinkingFormat: "qwen-chat-template",
+				supportsUsageInStreaming: true,
+			},
+		});
+		await expect(Promise.resolve(payloads[0])).resolves.toMatchObject({
+			temperature: 0.2,
+			top_p: 0.9,
+			top_k: 20,
+			min_p: 0.02,
+			repeat_penalty: 1.02,
+			repeat_last_n: 128,
+		});
+	});
+
 	it("disables Qwen thinking in payload defaults when no thinking level is requested", async () => {
 		const dir = tempDir();
 		touch(join(dir, "qwen-coder.gguf"));

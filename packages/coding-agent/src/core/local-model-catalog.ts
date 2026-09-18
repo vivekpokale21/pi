@@ -56,7 +56,9 @@ export interface LocalModelProviderRuntime {
 	ensureReady(target: LocalModelRuntimeTarget, signal?: AbortSignal): Promise<LocalModelRuntimeEndpoint>;
 	inferenceBaseUrl(endpoint: LocalModelRuntimeEndpoint): string;
 	subscribe?(listener: (state: LocalModelRuntimeState) => void): () => void;
+	getState?(): LocalModelRuntimeState;
 	getLogSnapshot?(): LocalModelRuntimeLogEntry[];
+	getProcessId?(): number | undefined;
 	shutdown?(): Promise<void>;
 }
 
@@ -117,7 +119,7 @@ function toPiModel(entry: LocalModelCatalogEntry): Model<"openai-completions"> {
 }
 
 function isQwenLocalModel(entry: LocalModelCatalogEntry): boolean {
-	return /\bqwen\b|qwen\d|qwen[-_.]/iu.test(`${entry.id} ${entry.name}`);
+	return /\bqwen\b|qwen\d|qwen[-_.]|kat[-_.]?coder/iu.test(`${entry.id} ${entry.name}`);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

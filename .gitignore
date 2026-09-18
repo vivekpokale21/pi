@@ -45,6 +45,8 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 .pi/handoffs/
+.pi/goals/
+.semantic_search/
 collect.sh
 
 # Local benchmark harnesses and experiments

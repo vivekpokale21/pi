@@ -10,6 +10,7 @@ import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import { flushRawStdout, writeRawStdout } from "../core/output-guard.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
+import { compactJsonEvent, createPrintObservabilityFromEnv } from "./print-observability.ts";
 
 /**
  * Options for print mode.
@@ -35,12 +36,15 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let disposed = false;
+	let pendingHandoffPath: string | undefined;
 	const signalCleanupHandlers: Array<() => void> = [];
+	const observability = createPrintObservabilityFromEnv(runtimeHost);
 
 	const disposeRuntime = async (): Promise<void> => {
 		if (disposed) return;
 		disposed = true;
 		unsubscribe?.();
+		observability.dispose();
 		await runtimeHost.dispose();
 	};
 
@@ -102,10 +106,39 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 		unsubscribe?.();
 		unsubscribe = session.subscribe((event) => {
+			observability.perfLogger?.handleEvent(event);
+			observability.systemMetricsLogger?.handleEvent(event);
+			if (event.type === "context_handoff_written") {
+				pendingHandoffPath = event.handoffPath;
+			}
 			if (mode === "json") {
-				writeRawStdout(`${JSON.stringify(event)}\n`);
+				writeRawStdout(`${JSON.stringify(observability.compactJson ? compactJsonEvent(event) : event)}\n`);
 			}
 		});
+	};
+
+	const continueFromPendingHandoff = async (): Promise<void> => {
+		const handoffPath = pendingHandoffPath;
+		const intent =
+			"getPendingHandoffContinuationIntent" in session ? session.getPendingHandoffContinuationIntent() : undefined;
+		if (!handoffPath || !intent) {
+			return;
+		}
+		pendingHandoffPath = undefined;
+		await session.continueFromHandoff({
+			handoffPath,
+			originalGoal: intent.originalGoal,
+		});
+		await session.prompt("continue");
+	};
+
+	const promptAndContinueFromHandoff = async (message: string, images?: ImageContent[]): Promise<void> => {
+		if (images) {
+			await session.prompt(message, { images });
+		} else {
+			await session.prompt(message);
+		}
+		await continueFromPendingHandoff();
 	};
 
 	try {
@@ -117,13 +150,24 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		}
 
 		await rebindSession();
+		if (observability.waitForSemanticVectors) {
+			observability.systemMetricsLogger?.sample("semantic_vector_warmup_start");
+			await runtimeHost.services.semanticIndex.ready;
+			await runtimeHost.services.semanticIndex.vectorsReady;
+			observability.systemMetricsLogger?.sample("semantic_vector_warmup_end");
+			if (runtimeHost.services.semanticIndex.vectorStatus !== "ready") {
+				throw new Error(
+					`Semantic vector warmup did not reach ready state: ${runtimeHost.services.semanticIndex.vectorStatus}`,
+				);
+			}
+		}
 
 		if (initialMessage) {
-			await session.prompt(initialMessage, { images: initialImages });
+			await promptAndContinueFromHandoff(initialMessage, initialImages);
 		}
 
 		for (const message of messages) {
-			await session.prompt(message);
+			await promptAndContinueFromHandoff(message);
 		}
 
 		if (mode === "text") {

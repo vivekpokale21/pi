@@ -2,8 +2,9 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, getModel, registerFauxProvider } from "@earendil-works/pi-ai/compat";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import type { ExtensionAPI } from "../src/core/extensions/index.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import {
 	createNativeBenchmarkCliPlan,
@@ -420,6 +421,87 @@ describe("native benchmark capability declaration", () => {
 		expect(result.metrics.retrievalSearches).toBe(1);
 	});
 
+	it("continues from a handoff and counts lifecycle events in native benchmark metrics", async () => {
+		const faux = registerFauxProvider();
+		cleanups.push(() => faux.unregister());
+		faux.setResponses([
+			fauxAssistantMessage(
+				fauxToolCall("handoff", {
+					profile: "planner",
+					title: "Continue Native Workflow",
+					goal: "Continue the native planner/executor handoff workflow.",
+					nonGoals: ["Do not use the legacy migration harness."],
+					inspectedFiles: ["packages/coding-agent/src/core/native-benchmark.ts"],
+					facts: ["Native benchmark records AgentSession events."],
+					decisions: ["Count handoff lifecycle events in metrics."],
+					plan: ["Add metrics fields."],
+					verification: ["node node_modules/vitest/dist/cli.js --run test/native-benchmark-capabilities.test.ts"],
+					staleStateChecks: ["Run git status before editing."],
+					risks: ["A write-only handoff can be mistaken for continuation."],
+					stopConditions: ["Stop if no post-handoff turn occurs."],
+					unexplored: ["End-to-end continuation."],
+					completed: ["Handoff tool exists."],
+					nextSlice: ["Add benchmark metrics."],
+				}),
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("handoff written"),
+			fauxAssistantMessage("handoff metrics recorded"),
+		]);
+
+		const authStorage = AuthStorage.inMemory();
+		await authStorage.modify(faux.getModel().provider, async () => ({ type: "api_key", key: "faux-key" }));
+		const modelRuntime = await ModelRuntime.create({
+			credentials: authStorage,
+			modelsPath: join(tempDir, "models.json"),
+		});
+		cleanups.push(() => modelRuntime.dispose());
+		const model = faux.getModel();
+		modelRuntime.registerProvider(model.provider, {
+			baseUrl: model.baseUrl,
+			api: model.api,
+			models: [
+				{
+					id: model.id,
+					name: model.name,
+					api: model.api,
+					reasoning: model.reasoning,
+					input: model.input,
+					cost: model.cost,
+					contextWindow: model.contextWindow,
+					maxTokens: model.maxTokens,
+					baseUrl: model.baseUrl,
+				},
+			],
+		});
+
+		const result = await runNativeBenchmarkTask({
+			cwd: tempDir,
+			agentDir,
+			modelRuntime,
+			model,
+			settingsManager: SettingsManager.create(tempDir, agentDir),
+			task: {
+				id: "handoff-metrics",
+				prompt: "Write a handoff.",
+			},
+			resourceLoaderOptions: {
+				noSkills: true,
+				noPromptTemplates: true,
+				noThemes: true,
+			},
+		});
+
+		expect(result.events).toContainEqual(
+			expect.objectContaining({ type: "context_handoff_written", handoffPath: expect.any(String) }),
+		);
+		expect(result.metrics.handoffsWritten).toBe(1);
+		expect(result.metrics.handoffResumesStarted).toBe(1);
+		expect(result.metrics.handoffResumesCompleted).toBe(1);
+		expect(result.metrics.handoffResumeFailures).toBe(0);
+		expect(result.assistantText).toBe("handoff metrics recorded");
+	});
+
 	it("counts native edit attempts and failed edits", async () => {
 		const faux = registerFauxProvider();
 		cleanups.push(() => faux.unregister());
@@ -540,6 +622,10 @@ describe("native benchmark capability declaration", () => {
 				retrievalSearches: 0,
 				editAttempts: 0,
 				failedEdits: 0,
+				handoffsWritten: 0,
+				handoffResumesStarted: 0,
+				handoffResumesCompleted: 0,
+				handoffResumeFailures: 0,
 			},
 		});
 
@@ -588,6 +674,10 @@ describe("native benchmark capability declaration", () => {
 					retrievalSearches: 0,
 					editAttempts: 0,
 					failedEdits: 0,
+					handoffsWritten: 0,
+					handoffResumesStarted: 0,
+					handoffResumesCompleted: 0,
+					handoffResumeFailures: 0,
 				},
 			},
 		]);
@@ -642,6 +732,10 @@ describe("native benchmark capability declaration", () => {
 				retrievalSearches: 0,
 				editAttempts: 0,
 				failedEdits: 0,
+				handoffsWritten: 0,
+				handoffResumesStarted: 0,
+				handoffResumesCompleted: 0,
+				handoffResumeFailures: 0,
 			},
 		});
 
@@ -665,6 +759,10 @@ Metrics:
 - Retrieval searches: 0
 - Edit attempts: 0
 - Failed edits: 0
+- Handoffs written: 0
+- Handoff resumes started: 0
+- Handoff resumes completed: 0
+- Handoff resume failures: 0
 - Final assistant text length: 13
 
 Validation:
@@ -873,7 +971,75 @@ Extension diagnostics:
 			retrievalSearches: 0,
 			editAttempts: 0,
 			failedEdits: 0,
+			handoffsWritten: 0,
+			handoffResumesStarted: 0,
+			handoffResumesCompleted: 0,
+			handoffResumeFailures: 0,
 		});
+	});
+
+	it("uses one owned model runtime for all tasks in a corpus", async () => {
+		const faux = registerFauxProvider();
+		cleanups.push(() => faux.unregister());
+		faux.setResponses([fauxAssistantMessage("first task done"), fauxAssistantMessage("second task done")]);
+		const createSpy = vi.spyOn(ModelRuntime, "create");
+		const disposeSpy = vi.spyOn(ModelRuntime.prototype, "dispose");
+		cleanups.push(() => {
+			createSpy.mockRestore();
+			disposeSpy.mockRestore();
+		});
+
+		const result = await runNativeBenchmarkCorpus({
+			cwd: tempDir,
+			agentDir,
+			model: faux.getModel(),
+			settingsManager: SettingsManager.create(tempDir, agentDir),
+			corpus: {
+				id: "unit-corpus",
+				tasks: [
+					{
+						id: "first",
+						prompt: "Run first task.",
+						expectedAssistantTextIncludes: "first",
+					},
+					{
+						id: "second",
+						prompt: "Run second task.",
+						expectedAssistantTextIncludes: "second",
+					},
+				],
+			},
+			resourceLoaderOptions: {
+				extensionFactories: [
+					(pi: ExtensionAPI) => {
+						pi.registerProvider(faux.getModel().provider, {
+							baseUrl: faux.getModel().baseUrl,
+							apiKey: "faux-key",
+							api: faux.api,
+							models: faux.models.map((registeredModel) => ({
+								id: registeredModel.id,
+								name: registeredModel.name,
+								api: registeredModel.api,
+								reasoning: registeredModel.reasoning,
+								input: registeredModel.input,
+								cost: registeredModel.cost,
+								contextWindow: registeredModel.contextWindow,
+								maxTokens: registeredModel.maxTokens,
+							})),
+						});
+					},
+				],
+				noSkills: true,
+				noPromptTemplates: true,
+				noThemes: true,
+			},
+		});
+
+		expect(result.pass).toBe(true);
+		expect(createSpy).toHaveBeenCalledTimes(1);
+		expect(disposeSpy).not.toHaveBeenCalled();
+		const createdRuntime = await createSpy.mock.results[0]?.value;
+		await createdRuntime?.dispose();
 	});
 
 	it("copies a benchmark fixture workspace and runs validation in the copy", async () => {
@@ -1109,6 +1275,8 @@ Extension diagnostics:
 				"nomic-ai/CodeRankEmbed",
 				"--semantic-embedding-start-command",
 				"python -m local_embeddings --port 8129",
+				"--semantic-embedding-device",
+				"cuda",
 				"--semantic-embedding-batch-size",
 				"4",
 				"--keep-runtime-processes",
@@ -1130,6 +1298,7 @@ Extension diagnostics:
 				baseUrl: "http://127.0.0.1:8129/v1",
 				model: "nomic-ai/CodeRankEmbed",
 				startCommand: "python -m local_embeddings --port 8129",
+				device: "cuda",
 				batchSize: 4,
 			},
 			keepRuntimeProcesses: true,
@@ -1143,6 +1312,15 @@ Extension diagnostics:
 				allowedCommands: ["python3 -m unittest tests.test_api_day_contract_benchmark -v"],
 			},
 		});
+	});
+
+	it("keeps native runtime processes by default after a benchmark run", () => {
+		const plan = createNativeBenchmarkCliPlan([], { cwd: "/tmp/run-cwd", agentDir: "/tmp/agent" });
+
+		expect(plan.type).toBe("run");
+		if (plan.type === "run") {
+			expect(plan.keepRuntimeProcesses).toBe(true);
+		}
 	});
 
 	it("writes native benchmark corpus artifacts", () => {
@@ -1196,6 +1374,10 @@ Extension diagnostics:
 						retrievalSearches: 0,
 						editAttempts: 0,
 						failedEdits: 0,
+						handoffsWritten: 0,
+						handoffResumesStarted: 0,
+						handoffResumesCompleted: 0,
+						handoffResumeFailures: 0,
 					},
 				},
 			],
@@ -1209,6 +1391,10 @@ Extension diagnostics:
 				retrievalSearches: 0,
 				editAttempts: 0,
 				failedEdits: 0,
+				handoffsWritten: 0,
+				handoffResumesStarted: 0,
+				handoffResumesCompleted: 0,
+				handoffResumeFailures: 0,
 			},
 		};
 
@@ -1254,6 +1440,8 @@ Extension diagnostics:
 				"nomic-ai/CodeRankEmbed",
 				"--semantic-embedding-start-command",
 				"python -m local_embeddings --port 8129",
+				"--semantic-embedding-device",
+				"cuda",
 				"--keep-runtime-processes",
 				"--allow-validation",
 				"python3 -m unittest tests.test_api_day_contract_benchmark -v",
@@ -1302,6 +1490,10 @@ Extension diagnostics:
 									retrievalSearches: 0,
 									editAttempts: 0,
 									failedEdits: 0,
+									handoffsWritten: 0,
+									handoffResumesStarted: 0,
+									handoffResumesCompleted: 0,
+									handoffResumeFailures: 0,
 								},
 							},
 						],
@@ -1315,6 +1507,10 @@ Extension diagnostics:
 							retrievalSearches: 0,
 							editAttempts: 0,
 							failedEdits: 0,
+							handoffsWritten: 0,
+							handoffResumesStarted: 0,
+							handoffResumesCompleted: 0,
+							handoffResumeFailures: 0,
 						},
 					};
 				},
@@ -1329,7 +1525,46 @@ Extension diagnostics:
 		});
 		expect(receivedOptions?.semanticIndexOptions?.embedding?.id).toBe("nomic-ai/CodeRankEmbed");
 		expect(receivedOptions?.semanticIndexOptions?.embeddingRuntime?.getState().value).toBe("unloaded");
+		expect(receivedOptions?.semanticIndexOptions?.embeddingRuntime?.getStartCommand()).toBe(
+			"python -m local_embeddings --port 8129 --device cuda",
+		);
 		expect(receivedOptions?.disposeModelRuntime).toBe(false);
+		expect(receivedOptions?.localModelRuntimeLogPath).toBe(join(outputDir, "llama-server.log"));
 		expect(existsSync(join(outputDir, "corpus-summary.json"))).toBe(true);
+	});
+
+	it("selects the handoff continuation smoke task from the native benchmark CLI", async () => {
+		let taskIds: string[] = [];
+
+		const exitCode = await runNativeBenchmarkCli(["--task", "handoff-continuation-smoke", "--disable-validation"], {
+			cwd: tempDir,
+			agentDir,
+			runCorpus: async (options) => {
+				taskIds = options.corpus.tasks.map((task) => task.id);
+				return {
+					corpus: { id: "dubai-boom" },
+					pass: true,
+					results: [],
+					metrics: {
+						tasks: 0,
+						passedTasks: 0,
+						failedTasks: 0,
+						assistantTurns: 0,
+						toolCalls: 0,
+						failedToolCalls: 0,
+						retrievalSearches: 0,
+						editAttempts: 0,
+						failedEdits: 0,
+						handoffsWritten: 0,
+						handoffResumesStarted: 0,
+						handoffResumesCompleted: 0,
+						handoffResumeFailures: 0,
+					},
+				};
+			},
+		});
+
+		expect(exitCode).toBe(0);
+		expect(taskIds).toEqual(["handoff-continuation-smoke"]);
 	});
 });

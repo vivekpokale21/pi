@@ -118,10 +118,23 @@ describe("WorkspaceEmbeddingRuntimeManager", () => {
 			PI_SEMANTIC_EMBEDDING_BASE_URL: "http://127.0.0.1:8129/v1",
 			PI_SEMANTIC_EMBEDDING_MODEL: "nomic-ai/CodeRankEmbed",
 			PI_SEMANTIC_EMBEDDING_START_COMMAND: "python -m local_embeddings --port 8129",
+			PI_SEMANTIC_EMBEDDING_DEVICE: "cuda",
 		});
 
 		expect(options.embedding?.id).toBe("nomic-ai/CodeRankEmbed");
 		expect(options.embeddingRuntime?.getState().value).toBe("unloaded");
+		expect(options.embeddingRuntime?.getStartCommand()).toBe("python -m local_embeddings --port 8129 --device cuda");
+	});
+
+	it("rejects unknown embedding device values", () => {
+		expect(() =>
+			createSemanticIndexOptionsFromEnv({
+				PI_SEMANTIC_EMBEDDING_BASE_URL: "http://127.0.0.1:8129/v1",
+				PI_SEMANTIC_EMBEDDING_MODEL: "nomic-ai/CodeRankEmbed",
+				PI_SEMANTIC_EMBEDDING_START_COMMAND: "python -m local_embeddings --port 8129",
+				PI_SEMANTIC_EMBEDDING_DEVICE: "gpu",
+			}),
+		).toThrow("PI_SEMANTIC_EMBEDDING_DEVICE must be cpu or cuda");
 	});
 
 	it("disposes a service-owned embedding runtime with session services", async () => {
@@ -163,6 +176,54 @@ describe("WorkspaceEmbeddingRuntimeManager", () => {
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("Serve CodeRankEmbed");
 		expect(result.stdout).toContain("--model");
+		expect(result.stdout).toContain("--device");
 		expect(result.stdout).toContain("--max-seq-length");
+	});
+
+	it("does not hide CUDA devices when the CodeRankEmbed server is imported without CUDA_VISIBLE_DEVICES", () => {
+		const result = spawnSync(
+			"python3",
+			[
+				"-c",
+				[
+					"import os, runpy",
+					"os.environ.pop('CUDA_VISIBLE_DEVICES', None)",
+					"runpy.run_path('scripts/coderank-embed-server.py', run_name='not_main')",
+					"print('unset' if os.environ.get('CUDA_VISIBLE_DEVICES') is None else repr(os.environ.get('CUDA_VISIBLE_DEVICES')))",
+				].join("; "),
+			],
+			{
+				cwd: join(import.meta.dirname, ".."),
+				encoding: "utf8",
+			},
+		);
+
+		expect(result.status).toBe(0);
+		expect(result.stdout.trim()).toBe("unset");
+	});
+
+	it("includes embedding server output in load failure messages", async () => {
+		const manager = new WorkspaceEmbeddingRuntimeManager({
+			baseUrl: "http://127.0.0.1:8129/v1",
+			startCommand: "python -m local_embeddings --port 8129",
+			operations: {
+				executableExists: async () => true,
+				start: () =>
+					Object.assign(new FakeEmbeddingProcess(), {
+						getOutput: () => "RuntimeError: CUDA embedding device requested",
+					}),
+				waitUntilReady: async () => {
+					throw new Error("fetch failed");
+				},
+			},
+		});
+
+		await expect(manager.ensureReady()).rejects.toMatchObject({
+			code: "load_failed",
+			message: "fetch failed\nEmbedding server output:\nRuntimeError: CUDA embedding device requested",
+		});
+		expect(manager.getState().message).toBe(
+			"fetch failed\nEmbedding server output:\nRuntimeError: CUDA embedding device requested",
+		);
 	});
 });

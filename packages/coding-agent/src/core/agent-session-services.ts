@@ -183,20 +183,45 @@ function parsePositiveInteger(value: string | undefined): number | undefined {
 	return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+export type WorkspaceSemanticEmbeddingDevice = "cpu" | "cuda";
+
+function parseWorkspaceSemanticEmbeddingDevice(
+	value: string | undefined,
+): WorkspaceSemanticEmbeddingDevice | undefined {
+	if (value === undefined || value.trim().length === 0) return undefined;
+	if (value === "cpu" || value === "cuda") return value;
+	throw new Error("PI_SEMANTIC_EMBEDDING_DEVICE must be cpu or cuda");
+}
+
+export function withWorkspaceSemanticEmbeddingDevice(
+	startCommand: string,
+	device: WorkspaceSemanticEmbeddingDevice | undefined,
+): string {
+	if (!device) return startCommand;
+	return `${startCommand.trim()} --device ${device}`;
+}
+
 export function createSemanticIndexOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): WorkspaceSemanticIndexOptions {
 	const baseUrl = env.PI_SEMANTIC_EMBEDDING_BASE_URL;
 	const model = env.PI_SEMANTIC_EMBEDDING_MODEL;
 	const startCommand = env.PI_SEMANTIC_EMBEDDING_START_COMMAND;
+	const device = parseWorkspaceSemanticEmbeddingDevice(env.PI_SEMANTIC_EMBEDDING_DEVICE);
 	const embeddingBatchSize = parsePositiveInteger(env.PI_SEMANTIC_EMBEDDING_BATCH_SIZE);
+	const maxFileSizeBytes = parsePositiveInteger(env.PI_SEMANTIC_MAX_FILE_SIZE_BYTES);
+	const maxTotalBytes = parsePositiveInteger(env.PI_SEMANTIC_MAX_TOTAL_BYTES);
+	const maxFiles = parsePositiveInteger(env.PI_SEMANTIC_MAX_FILES);
 	const embeddingRuntime =
 		baseUrl && startCommand
 			? new WorkspaceEmbeddingRuntimeManager({
 					baseUrl,
-					startCommand,
+					startCommand: withWorkspaceSemanticEmbeddingDevice(startCommand, device),
 				})
 			: undefined;
 	return {
 		...(embeddingBatchSize ? { embeddingBatchSize } : {}),
+		...(maxFileSizeBytes ? { maxFileSizeBytes } : {}),
+		...(maxTotalBytes ? { maxTotalBytes } : {}),
+		...(maxFiles ? { maxFiles } : {}),
 		...(baseUrl && model
 			? {
 					embedding: createOpenAICompatibleWorkspaceEmbeddingProvider({

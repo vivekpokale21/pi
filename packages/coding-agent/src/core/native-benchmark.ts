@@ -12,9 +12,13 @@ import {
 	type CreateAgentSessionServicesOptions,
 	createAgentSessionFromServices,
 	createAgentSessionServices,
+	type WorkspaceSemanticEmbeddingDevice,
+	withWorkspaceSemanticEmbeddingDevice,
 } from "./agent-session-services.ts";
+import { createGoalStore } from "./goal-state.ts";
 import type { LocalModelRuntimeLogEntry } from "./local-model-runtime-manager.ts";
 import { resolveCliModel } from "./model-resolver.ts";
+import { ModelRuntime } from "./model-runtime.ts";
 import { SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
 import { createOpenAICompatibleWorkspaceEmbeddingProvider } from "./workspace-embedding-provider.ts";
@@ -80,6 +84,13 @@ export interface NativeBenchmarkEventTrace {
 	isError?: boolean;
 	resultText?: string;
 	state?: string;
+	handoffPath?: string;
+	profile?: string;
+	sourceProfile?: string;
+	transition?: string;
+	band?: string;
+	bytes?: number;
+	error?: string;
 }
 
 export interface NativeBenchmarkTaskResult {
@@ -105,6 +116,16 @@ export interface NativeBenchmarkTaskResult {
 		retrievalSearches: number;
 		editAttempts: number;
 		failedEdits: number;
+		handoffsWritten: number;
+		handoffResumesStarted: number;
+		handoffResumesCompleted: number;
+		handoffResumeFailures: number;
+	};
+	performance?: {
+		durationMs: number;
+		inputTokens: number;
+		outputTokens: number;
+		tokensPerSecond: number;
 	};
 }
 
@@ -129,6 +150,16 @@ export interface NativeBenchmarkCorpusResult {
 		retrievalSearches: number;
 		editAttempts: number;
 		failedEdits: number;
+		handoffsWritten: number;
+		handoffResumesStarted: number;
+		handoffResumesCompleted: number;
+		handoffResumeFailures: number;
+	};
+	performance?: {
+		durationMs: number;
+		inputTokens: number;
+		outputTokens: number;
+		tokensPerSecond: number;
 	};
 }
 
@@ -185,6 +216,7 @@ export interface NativeBenchmarkSemanticEmbeddingOptions {
 	startCommand?: string;
 	apiKey?: string;
 	batchSize?: number;
+	device?: WorkspaceSemanticEmbeddingDevice;
 }
 
 export interface NativeBenchmarkValidationOptions extends NativeBenchmarkShellCommandValidationOptions {
@@ -248,7 +280,16 @@ export interface NativeBenchmarkCorpusOptions extends NativeBenchmarkCapabilityO
 	corpus: NativeBenchmarkTaskCorpus;
 	workspace?: NativeBenchmarkWorkspaceOptions;
 	validation?: NativeBenchmarkValidationOptions;
+	localModelRuntimeLogPath?: string;
 }
+
+const NATIVE_HANDOFF_CONTINUATION_SMOKE_TASK: NativeBenchmarkTask = {
+	id: "handoff-continuation-smoke",
+	title: "Native fresh-context handoff continuation smoke",
+	prompt:
+		"Start or continue the active benchmark goal by writing a planner handoff with the handoff tool. The handoff must include the current goal, inspected files, stale-state checks, verification commands, completed work, unexplored items, and a concrete executor next slice. After the automatic fresh-context continuation resumes, validate the handoff with handoff_status, then reply with exactly: handoff continuation smoke complete.",
+	expectedAssistantTextIncludes: "handoff continuation smoke complete",
+};
 
 const NATIVE_DUBAI_BOOM_BENCHMARK_TASKS: NativeBenchmarkTask[] = [
 	{
@@ -362,11 +403,15 @@ Options:
   --semantic-embedding-model <id> Embedding model id for native semantic_search.
   --semantic-embedding-start-command <command>
                                   Optional command Pi starts before embedding calls.
+  --semantic-embedding-device <cpu|cuda>
+                                  Device passed to the bundled embedding server command.
   --semantic-embedding-api-key <key>
                                   Optional embeddings API key.
   --semantic-embedding-batch-size <n>
                                   Optional document embedding batch size.
-  --keep-runtime-processes        Leave native model runtime processes running after benchmark services dispose.
+  --keep-runtime-processes        Leave native model runtime processes running after benchmark services dispose (default).
+  --dispose-runtime-processes     Stop native model runtime processes after benchmark completion.
+  PI_LOCAL_LLAMA_ARGS             For MTP runs, set to '--spec-type draft-mtp --spec-draft-n-max 3'.
   --allow-validation <command>    Allow one validation command. May be repeated.
   --disable-validation            Do not execute task validation commands.
   --help                          Show this help.
@@ -400,9 +445,10 @@ export function createNativeBenchmarkCliPlan(
 	let semanticEmbeddingBaseUrl: string | undefined;
 	let semanticEmbeddingModel: string | undefined;
 	let semanticEmbeddingStartCommand: string | undefined;
+	let semanticEmbeddingDevice: WorkspaceSemanticEmbeddingDevice | undefined;
 	let semanticEmbeddingApiKey: string | undefined;
 	let semanticEmbeddingBatchSize: number | undefined;
-	let keepRuntimeProcesses = false;
+	let keepRuntimeProcesses = true;
 	let taskIds: string[] | undefined;
 	const allowedCommands: string[] = [];
 	let validationEnabled = true;
@@ -466,6 +512,15 @@ export function createNativeBenchmarkCliPlan(
 			index = parsed.nextIndex;
 			continue;
 		}
+		if (arg === "--semantic-embedding-device") {
+			const parsed = readFlagValue([...args], index, arg);
+			if (parsed.value !== "cpu" && parsed.value !== "cuda") {
+				throw new Error("--semantic-embedding-device must be cpu or cuda");
+			}
+			semanticEmbeddingDevice = parsed.value;
+			index = parsed.nextIndex;
+			continue;
+		}
 		if (arg === "--semantic-embedding-api-key") {
 			const parsed = readFlagValue([...args], index, arg);
 			semanticEmbeddingApiKey = parsed.value;
@@ -484,6 +539,10 @@ export function createNativeBenchmarkCliPlan(
 		}
 		if (arg === "--keep-runtime-processes") {
 			keepRuntimeProcesses = true;
+			continue;
+		}
+		if (arg === "--dispose-runtime-processes") {
+			keepRuntimeProcesses = false;
 			continue;
 		}
 		if (arg === "--allow-validation") {
@@ -517,6 +576,7 @@ export function createNativeBenchmarkCliPlan(
 						baseUrl: semanticEmbeddingBaseUrl,
 						model: semanticEmbeddingModel,
 						startCommand: semanticEmbeddingStartCommand,
+						device: semanticEmbeddingDevice,
 						apiKey: semanticEmbeddingApiKey,
 						batchSize: semanticEmbeddingBatchSize,
 					}
@@ -542,7 +602,10 @@ function semanticIndexOptionsFromBenchmarkPlan(
 	const embeddingRuntime = semanticEmbedding.startCommand
 		? new WorkspaceEmbeddingRuntimeManager({
 				baseUrl: semanticEmbedding.baseUrl,
-				startCommand: semanticEmbedding.startCommand,
+				startCommand: withWorkspaceSemanticEmbeddingDevice(
+					semanticEmbedding.startCommand,
+					semanticEmbedding.device,
+				),
 			})
 		: undefined;
 	return {
@@ -560,7 +623,9 @@ function semanticIndexOptionsFromBenchmarkPlan(
 }
 
 function selectNativeBenchmarkTasks(taskIds: readonly string[]): NativeBenchmarkTask[] {
-	const tasksById = new Map(getNativeDubaiBoomBenchmarkTasks().map((task) => [task.id, task]));
+	const tasksById = new Map(
+		[...getNativeDubaiBoomBenchmarkTasks(), NATIVE_HANDOFF_CONTINUATION_SMOKE_TASK].map((task) => [task.id, task]),
+	);
 	const tasks: NativeBenchmarkTask[] = [];
 	for (const taskId of taskIds) {
 		const task = tasksById.get(taskId);
@@ -596,8 +661,19 @@ Metrics:
 - Retrieval searches: ${result.metrics.retrievalSearches}
 - Edit attempts: ${result.metrics.editAttempts}
 - Failed edits: ${result.metrics.failedEdits}
-
-Tasks:
+- Handoffs written: ${result.metrics.handoffsWritten}
+- Handoff resumes started: ${result.metrics.handoffResumesStarted}
+- Handoff resumes completed: ${result.metrics.handoffResumesCompleted}
+- Handoff resume failures: ${result.metrics.handoffResumeFailures}
+${
+	result.performance
+		? `- Duration (ms): ${result.performance.durationMs}
+- Input tokens: ${result.performance.inputTokens}
+- Output tokens: ${result.performance.outputTokens}
+- Output tokens/sec: ${result.performance.tokensPerSecond.toFixed(2)}
+`
+		: "\n"
+}Tasks:
 ${tasks || "- none"}
 `;
 }
@@ -711,6 +787,7 @@ export async function runNativeBenchmarkCli(
 			thinkingLevel,
 			disposeModelRuntime: !plan.keepRuntimeProcesses,
 			semanticIndexOptions: semanticIndexOptionsFromBenchmarkPlan(plan.semanticEmbedding),
+			localModelRuntimeLogPath: process.env.PI_LOCAL_LLAMA_LOG_PATH ?? join(plan.outputDir, "llama-server.log"),
 			corpus: {
 				id: "dubai-boom",
 				tasks,
@@ -855,6 +932,34 @@ function traceEvent(event: AgentSessionEvent): NativeBenchmarkEventTrace {
 			};
 		case "local_model_runtime_state":
 			return { type: event.type, state: event.state.value };
+		case "context_handoff_required":
+			return {
+				type: event.type,
+				band: event.band,
+				sourceProfile: event.sourceProfile,
+			};
+		case "context_handoff_written":
+			return {
+				type: event.type,
+				handoffPath: event.handoffPath,
+				profile: event.profile,
+				sourceProfile: event.sourceProfile,
+				bytes: event.bytes,
+			};
+		case "context_handoff_resume_started":
+		case "context_handoff_resume_completed":
+			return {
+				type: event.type,
+				handoffPath: event.handoffPath,
+				transition: event.transition,
+			};
+		case "context_handoff_resume_failed":
+			return {
+				type: event.type,
+				handoffPath: event.handoffPath,
+				transition: event.transition,
+				error: event.error,
+			};
 		default:
 			return { type: event.type };
 	}
@@ -871,6 +976,10 @@ function countToolCallsByName(events: readonly NativeBenchmarkEventTrace[]): Rec
 		counts[event.toolName] = (counts[event.toolName] ?? 0) + 1;
 	}
 	return counts;
+}
+
+function countEvents(events: readonly NativeBenchmarkEventTrace[], type: AgentSessionEvent["type"]): number {
+	return events.filter((event) => event.type === type).length;
 }
 
 function evaluateNativeBenchmarkTask(
@@ -1029,6 +1138,7 @@ export async function declareNativeBenchmarkCapabilities(
 }
 
 export async function runNativeBenchmarkTask(options: NativeBenchmarkTaskOptions): Promise<NativeBenchmarkTaskResult> {
+	const startedAt = Date.now();
 	const workspace = prepareNativeBenchmarkWorkspace(options.task, options.workspace);
 	const services = await createAgentSessionServices({
 		...options,
@@ -1051,17 +1161,36 @@ export async function runNativeBenchmarkTask(options: NativeBenchmarkTaskOptions
 		await session.bindExtensions({ mode: "print" });
 
 		const events: NativeBenchmarkEventTrace[] = [];
+		let pendingHandoffPath: string | undefined;
 		const unsubscribe = session.subscribe((event) => {
+			if (event.type === "context_handoff_written") {
+				pendingHandoffPath = event.handoffPath;
+			}
 			events.push(traceEvent(event));
 		});
 		try {
+			const goalObjective = options.task.title ?? options.task.prompt;
+			await createGoalStore(services.cwd).start({ objective: goalObjective });
 			await session.prompt(options.task.prompt, { source: "rpc" });
+			const handoffPath = pendingHandoffPath;
+			if (handoffPath) {
+				pendingHandoffPath = undefined;
+				await session.continueFromHandoff({
+					handoffPath,
+					originalGoal: goalObjective,
+				});
+				await session.prompt("continue", { source: "rpc" });
+			}
 		} finally {
 			unsubscribe();
 		}
 
 		const assistant = assistantMessages(session).at(-1);
 		const assistantText = assistant ? contentText(assistant.content, "") : "";
+		const assistantMessagesForMetrics = assistantMessages(session);
+		const inputTokens = assistantMessagesForMetrics.reduce((sum, message) => sum + message.usage.input, 0);
+		const outputTokens = assistantMessagesForMetrics.reduce((sum, message) => sum + message.usage.output, 0);
+		const durationMs = Date.now() - startedAt;
 		const validation = await runNativeBenchmarkValidation(options.task, services.cwd, options.validation);
 		const evaluation = evaluateNativeBenchmarkTask(options.task, assistantText, validation);
 		const toolEndEvents = events.filter((event) => event.type === "tool_execution_end");
@@ -1088,13 +1217,23 @@ export async function runNativeBenchmarkTask(options: NativeBenchmarkTaskOptions
 			validation,
 			events,
 			metrics: {
-				assistantTurns: assistantMessages(session).length,
+				assistantTurns: assistantMessagesForMetrics.length,
 				toolCalls: events.filter((event) => event.type === "tool_execution_start").length,
 				toolCallsByName,
 				failedToolCalls: toolEndEvents.filter((event) => event.isError).length,
 				retrievalSearches: toolCallsByName.semantic_search ?? 0,
 				editAttempts: toolCallsByName.edit ?? 0,
 				failedEdits: editEndEvents.filter((event) => event.isError).length,
+				handoffsWritten: countEvents(events, "context_handoff_written"),
+				handoffResumesStarted: countEvents(events, "context_handoff_resume_started"),
+				handoffResumesCompleted: countEvents(events, "context_handoff_resume_completed"),
+				handoffResumeFailures: countEvents(events, "context_handoff_resume_failed"),
+			},
+			performance: {
+				durationMs,
+				inputTokens,
+				outputTokens,
+				tokensPerSecond: durationMs > 0 ? (outputTokens * 1000) / durationMs : 0,
 			},
 		};
 	} finally {
@@ -1106,17 +1245,44 @@ export async function runNativeBenchmarkTask(options: NativeBenchmarkTaskOptions
 export async function runNativeBenchmarkCorpus(
 	options: NativeBenchmarkCorpusOptions,
 ): Promise<NativeBenchmarkCorpusResult> {
+	const sharedAgentDir = options.agentDir ? resolve(options.agentDir) : getAgentDir();
+	const sharedModelRuntime =
+		options.modelRuntime ??
+		(await ModelRuntime.create({
+			authPath: join(sharedAgentDir, "auth.json"),
+			modelsPath: join(sharedAgentDir, "models.json"),
+			localModelRuntimeOptions: {
+				retainAfterParentExit: options.disposeModelRuntime !== true,
+				logPath: options.localModelRuntimeLogPath,
+			},
+		}));
+	const disposeSharedModelRuntime = !options.modelRuntime && options.disposeModelRuntime === true;
 	const results: NativeBenchmarkTaskResult[] = [];
-	for (const task of options.corpus.tasks) {
-		results.push(
-			await runNativeBenchmarkTask({
-				...options,
-				task,
-			}),
-		);
+	try {
+		for (const task of options.corpus.tasks) {
+			results.push(
+				await runNativeBenchmarkTask({
+					...options,
+					modelRuntime: sharedModelRuntime,
+					disposeModelRuntime: false,
+					task,
+				}),
+			);
+		}
+	} finally {
+		if (disposeSharedModelRuntime) await sharedModelRuntime.dispose();
 	}
 
 	const passedTasks = results.filter((result) => result.pass).length;
+	const performance = results.reduce(
+		(accumulator, result) => {
+			accumulator.durationMs += result.performance?.durationMs ?? 0;
+			accumulator.inputTokens += result.performance?.inputTokens ?? 0;
+			accumulator.outputTokens += result.performance?.outputTokens ?? 0;
+			return accumulator;
+		},
+		{ durationMs: 0, inputTokens: 0, outputTokens: 0 },
+	);
 	return {
 		corpus: {
 			id: options.corpus.id,
@@ -1133,6 +1299,14 @@ export async function runNativeBenchmarkCorpus(
 			retrievalSearches: results.reduce((sum, result) => sum + result.metrics.retrievalSearches, 0),
 			editAttempts: results.reduce((sum, result) => sum + result.metrics.editAttempts, 0),
 			failedEdits: results.reduce((sum, result) => sum + result.metrics.failedEdits, 0),
+			handoffsWritten: results.reduce((sum, result) => sum + result.metrics.handoffsWritten, 0),
+			handoffResumesStarted: results.reduce((sum, result) => sum + result.metrics.handoffResumesStarted, 0),
+			handoffResumesCompleted: results.reduce((sum, result) => sum + result.metrics.handoffResumesCompleted, 0),
+			handoffResumeFailures: results.reduce((sum, result) => sum + result.metrics.handoffResumeFailures, 0),
+		},
+		performance: {
+			...performance,
+			tokensPerSecond: performance.durationMs > 0 ? (performance.outputTokens * 1000) / performance.durationMs : 0,
 		},
 	};
 }
@@ -1226,9 +1400,20 @@ Metrics:
 - Retrieval searches: ${result.metrics.retrievalSearches}
 - Edit attempts: ${result.metrics.editAttempts}
 - Failed edits: ${result.metrics.failedEdits}
+- Handoffs written: ${result.metrics.handoffsWritten}
+- Handoff resumes started: ${result.metrics.handoffResumesStarted}
+- Handoff resumes completed: ${result.metrics.handoffResumesCompleted}
+- Handoff resume failures: ${result.metrics.handoffResumeFailures}
 - Final assistant text length: ${result.finalAssistantTextLength}
-
-Validation:
+${
+	result.performance
+		? `- Duration (ms): ${result.performance.durationMs}
+- Input tokens: ${result.performance.inputTokens}
+- Output tokens: ${result.performance.outputTokens}
+- Output tokens/sec: ${result.performance.tokensPerSecond.toFixed(2)}
+`
+		: "\n"
+}Validation:
 ${validation}
 
 Local runtime logs:

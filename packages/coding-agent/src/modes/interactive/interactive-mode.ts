@@ -73,6 +73,9 @@ import type {
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
+import { executeGoalCommand } from "../../core/goal-command.ts";
+import { createGoalStore } from "../../core/goal-state.ts";
+import { formatHandoffContinuationStatus } from "../../core/handoff-continuation.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
@@ -414,6 +417,8 @@ export class InteractiveMode {
 
 	// Track pending bash components (shown in pending area, moved to chat on submit)
 	private pendingBashComponents: BashExecutionComponent[] = [];
+	private pendingHandoffContinuationPath: string | undefined = undefined;
+	private isContinuingFromHandoff = false;
 
 	// Auto-compaction state
 	private autoCompactionEscapeHandler?: () => void;
@@ -501,7 +506,7 @@ export class InteractiveMode {
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
 		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
-		this.footer = new FooterComponent(this.session, this.footerDataProvider);
+		this.footer = new FooterComponent(this.session, this.footerDataProvider, this.runtimeHost.services.semanticIndex);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
 
 		// Load hide thinking block setting
@@ -1732,7 +1737,7 @@ export class InteractiveMode {
 
 	private applyRuntimeSettings(): void {
 		configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
-		this.footer.setSession(this.session);
+		this.footer.setSession(this.session, this.runtimeHost.services.semanticIndex);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
 		this.footerDataProvider.setCwd(this.sessionManager.getCwd());
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -2769,9 +2774,19 @@ export class InteractiveMode {
 				await this.handleCompactCommand(customInstructions);
 				return;
 			}
+			if (text === "/goal" || text.startsWith("/goal ")) {
+				this.editor.setText("");
+				await this.handleGoalCommand(text);
+				return;
+			}
 			if (text === "/reload") {
 				this.editor.setText("");
 				await this.handleReloadCommand();
+				return;
+			}
+			if (text === "/semantic-refresh") {
+				this.editor.setText("");
+				await this.handleSemanticRefreshCommand();
 				return;
 			}
 			if (text === "/debug") {
@@ -3082,7 +3097,32 @@ export class InteractiveMode {
 
 			case "agent_settled":
 				await this.checkShutdownRequested();
+				await this.continueFromPendingHandoff();
 				break;
+
+			case "context_handoff_required":
+			case "context_handoff_written":
+			case "context_handoff_resume_started":
+			case "context_handoff_resume_completed": {
+				if (event.type === "context_handoff_written") {
+					this.pendingHandoffContinuationPath = event.handoffPath;
+				}
+				const status = formatHandoffContinuationStatus(event);
+				if (status?.level === "status") {
+					this.showStatus(status.message);
+				}
+				this.ui.requestRender();
+				break;
+			}
+
+			case "context_handoff_resume_failed": {
+				const status = formatHandoffContinuationStatus(event);
+				if (status?.level === "error") {
+					this.showError(status.message);
+				}
+				this.ui.requestRender();
+				break;
+			}
 
 			case "compaction_start": {
 				if (this.settingsManager.getShowTerminalProgress()) {
@@ -3190,6 +3230,28 @@ export class InteractiveMode {
 				this.ui.requestRender();
 				break;
 			}
+		}
+	}
+
+	private async continueFromPendingHandoff(): Promise<void> {
+		if (this.isContinuingFromHandoff) {
+			return;
+		}
+		const handoffPath = this.pendingHandoffContinuationPath;
+		const intent = this.session.getPendingHandoffContinuationIntent();
+		if (!handoffPath || !intent) {
+			return;
+		}
+		this.pendingHandoffContinuationPath = undefined;
+		this.isContinuingFromHandoff = true;
+		try {
+			await this.session.continueFromHandoff({
+				handoffPath,
+				originalGoal: intent.originalGoal,
+			});
+			await this.session.prompt("continue");
+		} finally {
+			this.isContinuingFromHandoff = false;
 		}
 	}
 
@@ -5311,6 +5373,16 @@ export class InteractiveMode {
 	// Command handlers
 	// =========================================================================
 
+	private async handleGoalCommand(text: string): Promise<void> {
+		try {
+			const args = text === "/goal" ? "" : text.slice("/goal ".length);
+			const result = await executeGoalCommand(createGoalStore(this.sessionManager.getCwd()), args);
+			this.showStatus(result.message);
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
 	private async handleReloadCommand(): Promise<void> {
 		if (this.session.isStreaming) {
 			this.showWarning("Wait for the current response to finish before reloading.");
@@ -5413,6 +5485,26 @@ export class InteractiveMode {
 			}
 			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
+	}
+
+	private async handleSemanticRefreshCommand(): Promise<void> {
+		if (this.session.isStreaming) {
+			this.showWarning("Wait for the current response to finish before refreshing the semantic index.");
+			return;
+		}
+		if (this.session.isCompacting) {
+			this.showWarning("Wait for compaction to finish before refreshing the semantic index.");
+			return;
+		}
+
+		this.showStatus("Rebuilding semantic index...");
+		this.ui.requestRender();
+		await this.runtimeHost.services.semanticIndex.refresh();
+		const vectorStatus = this.runtimeHost.services.semanticIndex.vectorStatus;
+		const suffix = vectorStatus === "disabled" ? "" : `, vectors ${vectorStatus}`;
+		this.showStatus(`Semantic index rebuilt${suffix}.`);
+		this.footer.invalidate();
+		this.ui.requestRender();
 	}
 
 	private async handleExportCommand(text: string): Promise<void> {

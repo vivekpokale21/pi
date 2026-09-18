@@ -2,8 +2,10 @@ import { describe, expect, test } from "vitest";
 import {
 	buildContextBudgetReminder,
 	buildContextHandoffGuidance,
+	buildHandoffContinuationPrompt,
 	type ContextBudgetReminderInput,
 	getContextBudgetReminderBand,
+	inferHandoffContinuationPath,
 } from "../src/core/context-handoff.ts";
 
 const baseInput: ContextBudgetReminderInput = {
@@ -25,6 +27,102 @@ describe("context handoff guidance", () => {
 		expect(guidance).toContain("next slice");
 		expect(guidance).toContain("revalidate");
 		expect(guidance).toContain("git status");
+	});
+});
+
+describe("buildHandoffContinuationPrompt", () => {
+	test("builds a planner to planner continuation prompt", () => {
+		const prompt = buildHandoffContinuationPrompt({
+			transition: "planner_to_planner",
+			originalGoal: "Investigate native handoff orchestration.",
+			handoffPath: ".pi/handoffs/planner.md",
+			handoffContent: "## Current Facts With Provenance\n- Read agent-session.ts.",
+		});
+
+		expect(prompt).toContain("Continue the active goal without user intervention unless blocked.");
+		expect(prompt).toContain("Original goal: Investigate native handoff orchestration.");
+		expect(prompt).toContain("Continuation path: planner -> planner.");
+		expect(prompt).toContain("Handoff artifact: .pi/handoffs/planner.md");
+		expect(prompt).toContain("Planner role: continue targeted investigation");
+		expect(prompt).toContain("git status");
+		expect(prompt).toContain("referenced file existence");
+		expect(prompt).toContain("## Current Facts With Provenance");
+	});
+
+	test("builds a planner to executor continuation prompt", () => {
+		const prompt = buildHandoffContinuationPrompt({
+			transition: "planner_to_executor",
+			originalGoal: "Implement native handoff orchestration.",
+			handoffPath: ".pi/handoffs/plan.md",
+			handoffContent: "## Plan Steps\n- Add controller tests.",
+		});
+
+		expect(prompt).toContain("Continuation path: planner -> executor.");
+		expect(prompt).toContain("Executor role: revalidate before editing");
+		expect(prompt).toContain("focused verification");
+		expect(prompt).toContain("bounded implementation slice");
+	});
+
+	test("builds an executor to executor continuation prompt", () => {
+		const prompt = buildHandoffContinuationPrompt({
+			transition: "executor_to_executor",
+			originalGoal: "Continue implementation.",
+			handoffPath: ".pi/handoffs/executor.md",
+			handoffContent: "## Completed Work\n- Goal store is green.",
+		});
+
+		expect(prompt).toContain("Continuation path: executor -> executor.");
+		expect(prompt).toContain("Executor role: revalidate before editing");
+		expect(prompt).toContain("completed work");
+		expect(prompt).toContain("next bounded slice");
+	});
+});
+
+describe("inferHandoffContinuationPath", () => {
+	test("continues executor handoffs as executor to executor", () => {
+		expect(
+			inferHandoffContinuationPath({
+				profile: "executor",
+				content: "## Next Slice\n- Continue implementation.",
+			}),
+		).toBe("executor_to_executor");
+	});
+
+	test("continues planner handoffs with implementation next slice as planner to executor", () => {
+		expect(
+			inferHandoffContinuationPath({
+				profile: "planner",
+				content: "## Plan Steps\n- Implement the controller.\n\n## Next Slice\n- Edit handoff-continuation.ts.",
+			}),
+		).toBe("planner_to_executor");
+	});
+
+	test("continues planner handoffs with unexplored planning work as planner to planner", () => {
+		expect(
+			inferHandoffContinuationPath({
+				profile: "planner",
+				content:
+					"## Unexplored Items\n- Inspect agent-session restart behavior.\n\n## Next Slice\n- Investigate options.",
+			}),
+		).toBe("planner_to_planner");
+	});
+
+	test("ignores non-goal implementation terms when planner work remains investigative", () => {
+		expect(
+			inferHandoffContinuationPath({
+				profile: "planner",
+				content: [
+					"## Non-Goals",
+					"- Do not edit implementation files yet.",
+					"",
+					"## Plan Steps",
+					"- Read the remaining task list and refine the plan.",
+					"",
+					"## Next Slice",
+					"- Continue planning and document remaining questions.",
+				].join("\n"),
+			}),
+		).toBe("planner_to_planner");
 	});
 });
 

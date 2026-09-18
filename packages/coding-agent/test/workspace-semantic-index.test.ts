@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readFile as fsReadFile, stat as fsStat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,6 +29,16 @@ afterEach(() => {
 });
 
 describe("WorkspaceSemanticIndex", () => {
+	const builtSemanticIndexPath = join(import.meta.dirname, "../dist/core/workspace-semantic-index.js");
+
+	it.skipIf(!existsSync(builtSemanticIndexPath))("keeps built watcher refresh policy aligned with source", () => {
+		const dist = readFileSync(builtSemanticIndexPath, "utf8");
+
+		expect(dist).toContain("markStale");
+		expect(dist).not.toContain("scheduleRefresh");
+		expect(dist).not.toContain("void this.refresh()");
+	});
+
 	it("activates semantic_search in a default native session", async () => {
 		const root = tempDir();
 		const index = new WorkspaceSemanticIndex(root, { persist: false });
@@ -128,15 +138,81 @@ describe("WorkspaceSemanticIndex", () => {
 		}
 	});
 
+	it("does not rebuild document vectors across turns in one service-bound session", async () => {
+		const root = tempDir();
+		writeFileSync(join(root, "turn-vector.ts"), "export const persistentVectorNeedle = true;\n");
+		const documentBatches: string[][] = [];
+		const queryBatches: string[][] = [];
+		const services = await createAgentSessionServices({
+			cwd: root,
+			agentDir: root,
+			settingsManager: SettingsManager.create(root, root),
+			semanticIndexOptions: {
+				persist: false,
+				embeddingBatchSize: 4,
+				embedding: {
+					id: "test-vector-provider",
+					embed: async (texts) => {
+						if (texts.length === 1 && texts[0]?.includes("query")) {
+							queryBatches.push(texts);
+							return [[1, 0]];
+						}
+						documentBatches.push(texts);
+						return texts.map((text) => (text.includes("persistentVectorNeedle") ? [1, 0] : [0, 1]));
+					},
+				},
+			},
+		});
+		const first = await createAgentSessionFromServices({
+			services,
+			sessionManager: SessionManager.inMemory(root),
+			model: getModel("anthropic", "claude-sonnet-4-5")!,
+		});
+		const second = await createAgentSessionFromServices({
+			services,
+			sessionManager: SessionManager.inMemory(root),
+			model: getModel("anthropic", "claude-sonnet-4-5")!,
+		});
+
+		try {
+			await services.semanticIndex.ready;
+			await services.semanticIndex.vectorsReady;
+			const documentBatchCount = documentBatches.length;
+			expect(documentBatchCount).toBeGreaterThan(0);
+
+			for (const session of [first.session, second.session]) {
+				const semanticSearch = session.agent.state.tools.find((tool) => tool.name === "semantic_search");
+				const result = await semanticSearch!.execute(
+					"search",
+					{ query: "query persistent vector", limit: 1 },
+					undefined,
+					undefined,
+				);
+				expect(result.details?.vectorStatus).toBe("ready");
+			}
+
+			expect(documentBatches).toHaveLength(documentBatchCount);
+			expect(queryBatches).toHaveLength(2);
+		} finally {
+			first.session.dispose();
+			second.session.dispose();
+			await services.dispose?.();
+		}
+	});
+
 	it("builds shared semantic index options from Pi embedding environment settings", () => {
 		const options = createSemanticIndexOptionsFromEnv({
 			PI_SEMANTIC_EMBEDDING_BASE_URL: "http://127.0.0.1:8129/v1",
 			PI_SEMANTIC_EMBEDDING_MODEL: "nomic-ai/CodeRankEmbed",
 			PI_SEMANTIC_EMBEDDING_BATCH_SIZE: "4",
+			PI_SEMANTIC_MAX_FILE_SIZE_BYTES: "90000",
+			PI_SEMANTIC_MAX_TOTAL_BYTES: "12000000",
 		});
 
 		expect(options.embedding?.id).toBe("nomic-ai/CodeRankEmbed");
 		expect(options.embeddingBatchSize).toBe(4);
+		expect(options.maxFileSizeBytes).toBe(90_000);
+		expect(options.maxTotalBytes).toBe(12_000_000);
 	});
 
 	it("starts in the background and searches lexical content before readiness", async () => {
@@ -184,6 +260,61 @@ describe("WorkspaceSemanticIndex", () => {
 		expect(result.results[0]?.path).toBe("canvas.ts");
 		expect(result.vectorStatus).toBe("ready");
 		expect(result.results[0]).toMatchObject({ retrievalType: "semantic", semanticScore: 1 });
+	});
+
+	it("keeps ready vectors after watched edits until explicit refresh", async () => {
+		const root = tempDir();
+		const file = join(root, "watched-vector.ts");
+		writeFileSync(file, "export const oldVectorNeedle = true;\n");
+		const documentBatches: string[][] = [];
+		const queryBatches: string[][] = [];
+		const index = new WorkspaceSemanticIndex(root, {
+			persist: false,
+			watch: true,
+			embedding: {
+				embed: async (texts) => {
+					if (texts.length === 1 && texts[0]?.includes("query")) {
+						queryBatches.push(texts);
+						return [texts[0]?.includes("newVectorNeedle") ? [0, 1] : [1, 0]];
+					}
+					documentBatches.push(texts);
+					return texts.map((text) =>
+						text.includes("newVectorNeedle") ? [0, 1] : text.includes("oldVectorNeedle") ? [1, 0] : [0, 0],
+					);
+				},
+			},
+		});
+		index.start();
+		await index.ready;
+		await index.vectorsReady;
+		const initialDocumentBatchCount = documentBatches.length;
+		expect(index.vectorStatus).toBe("ready");
+		expect(initialDocumentBatchCount).toBeGreaterThan(0);
+
+		writeFileSync(file, "export const newVectorNeedle = true;\n");
+		const deadline = Date.now() + 1500;
+		while (Date.now() < deadline) {
+			if ((await index.search("query oldVectorNeedle")).freshness === "stale") break;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		const staleOld = await index.search("query oldVectorNeedle");
+		const staleNew = await index.search("query newVectorNeedle");
+
+		expect(index.vectorStatus).toBe("ready");
+		expect(staleOld.freshness).toBe("stale");
+		expect(staleOld.staleFileChangeCount).toBeGreaterThan(0);
+		expect(staleOld.results[0]?.path).toBe("watched-vector.ts");
+		expect(staleNew.results).toHaveLength(0);
+		expect(documentBatches).toHaveLength(initialDocumentBatchCount);
+		expect(queryBatches.length).toBeGreaterThanOrEqual(2);
+
+		await index.refresh();
+		const refreshed = await index.search("query newVectorNeedle");
+
+		expect(refreshed.freshness).toBe("clean");
+		expect(refreshed.results[0]?.path).toBe("watched-vector.ts");
+		expect(documentBatches.length).toBeGreaterThan(initialDocumentBatchCount);
+		index.cancel();
 	});
 
 	it("uses an optional reranker to reorder candidates and report rerank scores", async () => {
@@ -500,7 +631,7 @@ describe("WorkspaceSemanticIndex", () => {
 		expect(related && "receipt" in related).toBe(false);
 	});
 
-	it("debounces direct file changes when watching is enabled", async () => {
+	it("marks watched direct file changes stale without automatically refreshing", async () => {
 		const root = tempDir();
 		const file = join(root, "watched.ts");
 		writeFileSync(file, "export const oldValue = true;\n");
@@ -511,10 +642,15 @@ describe("WorkspaceSemanticIndex", () => {
 		writeFileSync(file, "export const newValue = true;\n");
 		const deadline = Date.now() + 1500;
 		while (Date.now() < deadline) {
-			if ((await index.search("newValue")).results.length > 0) break;
+			if ((await index.search("oldValue")).freshness === "stale") break;
 			await new Promise((resolve) => setTimeout(resolve, 25));
 		}
-		expect((await index.search("newValue")).results[0]?.path).toBe("watched.ts");
+		const staleResult = await index.search("oldValue");
+
+		expect(staleResult.results[0]?.path).toBe("watched.ts");
+		expect(staleResult.freshness).toBe("stale");
+		expect(staleResult.staleFileChangeCount).toBeGreaterThan(0);
+		expect((await index.search("newValue")).results).toHaveLength(0);
 		index.cancel();
 	});
 
@@ -567,7 +703,7 @@ describe("WorkspaceSemanticIndex", () => {
 		index.cancel();
 	});
 
-	it("watches nested directories and refreshes their files", async () => {
+	it("marks watched nested file changes stale without automatically refreshing", async () => {
 		const root = tempDir();
 		mkdirSync(join(root, "nested"));
 		writeFileSync(join(root, "nested", "watched.ts"), "export const nestedOld = true;\n");
@@ -578,14 +714,18 @@ describe("WorkspaceSemanticIndex", () => {
 		writeFileSync(join(root, "nested", "watched.ts"), "export const nestedNew = true;\n");
 		const deadline = Date.now() + 1500;
 		while (Date.now() < deadline) {
-			if ((await index.search("nestedNew")).results.length > 0) break;
+			if ((await index.search("nestedOld")).freshness === "stale") break;
 			await new Promise((resolve) => setTimeout(resolve, 25));
 		}
-		expect((await index.search("nestedNew")).results[0]?.path).toBe("nested/watched.ts");
+		const staleResult = await index.search("nestedOld");
+
+		expect(staleResult.results[0]?.path).toBe("nested/watched.ts");
+		expect(staleResult.freshness).toBe("stale");
+		expect((await index.search("nestedNew")).results).toHaveLength(0);
 		index.cancel();
 	});
 
-	it("refreshes when a new directory is created after the initial scan", async () => {
+	it("marks new watched directories stale without automatically refreshing", async () => {
 		const root = tempDir();
 		const index = new WorkspaceSemanticIndex(root, { watch: true });
 		index.start();
@@ -595,10 +735,14 @@ describe("WorkspaceSemanticIndex", () => {
 		writeFileSync(join(root, "created", "new.ts"), "export const createdValue = true;\n");
 		const deadline = Date.now() + 1500;
 		while (Date.now() < deadline) {
-			if ((await index.search("createdValue")).results.length > 0) break;
+			if ((await index.search("createdValue")).freshness === "stale") break;
 			await new Promise((resolve) => setTimeout(resolve, 25));
 		}
-		expect((await index.search("createdValue")).results[0]?.path).toBe("created/new.ts");
+		const staleResult = await index.search("createdValue");
+
+		expect(staleResult.results).toHaveLength(0);
+		expect(staleResult.freshness).toBe("stale");
+		expect(staleResult.staleFileChangeCount).toBeGreaterThan(0);
 		index.cancel();
 	});
 

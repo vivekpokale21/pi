@@ -36,6 +36,7 @@ import { createLocalModelProvider, type LocalModelProviderRuntime } from "./loca
 import {
 	type LocalModelRuntimeLogEntry,
 	LocalModelRuntimeManager,
+	type LocalModelRuntimeManagerOptions,
 	type LocalModelRuntimeState,
 } from "./local-model-runtime-manager.ts";
 import { ModelConfig } from "./model-config.ts";
@@ -74,6 +75,7 @@ export interface CreateModelRuntimeOptions {
 	modelRefreshTimeoutMs?: number;
 	catalogBaseUrl?: string;
 	localModelRuntimeManager?: LocalModelProviderRuntime;
+	localModelRuntimeOptions?: LocalModelRuntimeManagerOptions;
 }
 
 export interface ModelRuntimeAuthOverrides {
@@ -157,7 +159,8 @@ export class ModelRuntime implements Models {
 					? provider
 					: withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt),
 			);
-		const localModelRuntimeManager = options.localModelRuntimeManager ?? new LocalModelRuntimeManager();
+		const localModelRuntimeManager =
+			options.localModelRuntimeManager ?? new LocalModelRuntimeManager(options.localModelRuntimeOptions);
 		const localModelProvider = await createLocalModelProvider({ runtimeManager: localModelRuntimeManager });
 		const runtime = new ModelRuntime(
 			credentials,
@@ -370,8 +373,16 @@ export class ModelRuntime implements Models {
 		return this.localModelRuntimeManager?.subscribe?.(listener) ?? (() => {});
 	}
 
+	getLocalModelRuntimeState(): LocalModelRuntimeState | undefined {
+		return this.localModelRuntimeManager?.getState?.();
+	}
+
 	getLocalModelRuntimeLogSnapshot(): LocalModelRuntimeLogEntry[] {
 		return this.localModelRuntimeManager?.getLogSnapshot?.() ?? [];
+	}
+
+	getLocalModelRuntimeProcessId(): number | undefined {
+		return this.localModelRuntimeManager?.getProcessId?.();
 	}
 
 	/** @internal Compatibility fallback for ModelRegistry when provider auth is unconfigured. */
